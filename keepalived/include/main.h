@@ -29,6 +29,9 @@
 #include <stdbool.h>
 #include <sys/types.h>
 
+#include "scheduler.h"
+#include "pidfile.h"
+
 /* State flags */
 enum daemon_bits {
 #ifdef _WITH_VRRP_
@@ -54,32 +57,34 @@ enum daemon_bits {
 extern const char *version_string;	/* keepalived version */
 extern unsigned long daemon_mode;	/* Which child processes are run */
 extern const char *conf_file;		/* Configuration file */
-extern int log_facility;		/* Optional logging facilities */
 #ifdef _WITH_VRRP_
 extern pid_t vrrp_child;		/* VRRP child process ID */
-extern const char *vrrp_pidfile;	/* overrule default pidfile */
+extern pidfile_t vrrp_pidfile;		/* overrule default pidfile */
 extern bool have_vrrp_instances;	/* vrrp instances configured */
 #endif
 #ifdef _WITH_LVS_
 extern pid_t checkers_child;		/* Healthcheckers child process ID */
-extern const char *checkers_pidfile;	/* overrule default pidfile */
+extern pidfile_t checkers_pidfile;	/* overrule default pidfile */
 extern bool have_virtual_servers;	/* virtual servers configured */
 #endif
 #ifdef _WITH_BFD_
 extern pid_t bfd_child;			/* BFD child process ID */
-extern const char *bfd_pidfile;		/* overrule default pidfile */
+extern pidfile_t bfd_pidfile;		/* overrule default pidfile */
 extern bool have_bfd_instances;		/* bfd instances configured */
 #endif
 extern bool reload;			/* Set during a reload */
-extern const char *main_pidfile;	/* overrule default pidfile */
+extern pidfile_t main_pidfile;		/* overrule default pidfile */
 #ifdef _WITH_SNMP_
 extern bool snmp_option;		/* Enable SNMP support */
 extern const char *snmp_socket;		/* Socket to use for SNMP agent */
 #endif
 extern bool use_pid_dir;		/* pid files in /run/keepalived */
+extern bool children_started;		/* Set once children have been run first time */
 extern unsigned os_major;		/* Kernel version */
 extern unsigned os_minor;
 extern unsigned os_release;
+
+extern bool ignore_sigint;
 
 extern void free_parent_mallocs_startup(bool);
 extern void free_parent_mallocs_exit(void);
@@ -90,6 +95,8 @@ extern bool running_vrrp(void) __attribute__ ((pure));
 #ifdef _WITH_LVS_
 extern bool running_checker(void) __attribute__ ((pure));
 #endif
+extern void reinitialise_global_vars(void);
+extern void start_reload(thread_ref_t);
 
 #ifdef THREAD_DUMP
 extern void thread_dump_signal(void *, int);
@@ -99,5 +106,6 @@ extern int keepalived_main(int, char**); /* The "real" main function */
 
 extern unsigned child_wait_time;
 extern bool umask_cmdline;
+extern unsigned num_reloading;
 
 #endif

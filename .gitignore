@@ -1,50 +1,67 @@
-*.orig
-*.rej
-*.o
-*.a
-README
-bin/
-keepalived.spec
-*~
-*.swp
-.dir-locals.el
-keepalived-*.tar.gz
+# Build output. The upstream tree ships no .gitignore, and DANOS builds in
+# place, so autoreconf and make leave their products next to the sources.
 
-
-# http://www.gnu.org/software/automake
-Makefile
-Makefile.in
-
-# http://www.gnu.org/software/autoconf
-/autom4te.cache/
-/autoscan.log
-/autoscan-*.log
+# autoreconf / configure
+/configure
 /aclocal.m4
-/build-aux/
-/config.cache
-/config.h.in
 /config.log
 /config.status
-/configure.scan
-/lib/stamp-h[12]
-/m4/
+/build-aux/
+/m4/libtool.m4
+/m4/lt*.m4
+Makefile
+Makefile.in
+*.spec
 
+# compiler output
+*.o
+*.a
+*.lo
+*.la
 .deps/
+.libs/
+/bin/
+/bin_install/
 
-/tmp/
-/devel/
-/private/
+# generated headers and config
+/lib/config.h
+/lib/stamp-h1
+/lib/config.h.in
 
-# To be able to build without automake/autoconf comment out the following
-#/lib/config.h.in
-# Makefile.in
-#/configure
-configure.in.debian
-debian/stamp-autotools*
-debian/vyatta-keepalived.debhelper.log
+# debhelper
+/debian/files
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/*.debhelper
+/debian/debhelper-build-stamp
+/debian/keepalived/
+/debian/keepalived-dbgsym/
+/debian/.debhelper/
 
-# For snap builds
-parts/
-prime/
-stage/
-keepalived*.snap
+# quilt
+/.pc/
+
+# autoreconf scratch
+/autom4te.cache/
+/debian/autoreconf.after
+/debian/autoreconf.before
+
+# man pages generated from the .in templates
+/doc/man/man5/keepalived.conf.5
+/doc/man/man8/keepalived.8
+
+# dbus xml generated from the .xml_template
+/keepalived/dbus/org.keepalived.Vrrp1.Vrrp.xml
+
+# keepalived.conf.sample is generated from the .in
+/keepalived/etc/keepalived/keepalived.conf.sample
+
+# linked binary and generated units/headers
+/keepalived/keepalived
+/keepalived/keepalived.service
+/keepalived/keepalived-non-root.service
+/lib/stamp-h2
+/lib/git-commit.h
+
+# working copy of the pre-rebase patch set, kept for reference only
+/debian/patches.orig-2.2.0/

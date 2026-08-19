@@ -24,6 +24,7 @@
 #include "config.h"
 
 #include <openssl/err.h>
+#include <openssl/md5.h>
 #include <unistd.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -35,24 +36,22 @@
 #include <pcre2.h>
 #endif
 
-#include "check_http.h"
 #include "check_api.h"
+#include "check_http.h"
 #include "check_ssl.h"
 #include "bitops.h"
 #include "logger.h"
 #include "parser.h"
 #include "utils.h"
 #include "html.h"
-#if !HAVE_DECL_SOCK_CLOEXEC
-#include "old_socket.h"
-#include "string.h"
-#endif
 #include "layer4.h"
 #include "ipwrapper.h"
 #include "smtp.h"
 #ifdef THREAD_DUMP
 #include "scheduler.h"
 #endif
+#include "check_parser.h"
+
 
 typedef enum {
 	REGISTER_CHECKER_NEW,
@@ -121,6 +120,9 @@ bool do_regex_timers;
 bool do_regex_debug;
 #endif
 
+static url_t *current_url;
+
+
 /* GET processing command */
 static const char *request_template =
 			"GET %s HTTP/1.%d\r\n"
@@ -134,7 +136,14 @@ static const char *request_template_ipv6 =
 			"%s"
 			"Host: [%s]%s\r\n\r\n";
 
-static void http_connect_thread(thread_ref_t);
+/* Output delimiters */
+#define DELIM_BEGIN             "-----------------------["
+#define DELIM_END               "]-----------------------\n"
+#define HTTP_HEADER_HEXA        DELIM_BEGIN"    HTTP Header Buffer    "DELIM_END
+#define HTTP_HEADER_ASCII       DELIM_BEGIN" HTTP Header Ascii Buffer "DELIM_END
+#define HTML_HEADER_HEXA        DELIM_BEGIN"        HTML Buffer        "DELIM_END
+#define HTML_HASH               DELIM_BEGIN"    HTML hash resulting    "DELIM_END
+#define HTML_HASH_FINAL         DELIM_BEGIN" HTML hash final resulting "DELIM_END
 
 #ifdef _WITH_REGEX_CHECK_
 static void
@@ -187,7 +196,7 @@ free_url(url_t *url)
 
 #ifdef _WITH_REGEX_TIMERS_
 				if (do_regex_timers)
-					log_message(LOG_INFO, "Total regex time %ld.%9.9ld, num match calls %u, num url checks %u", total_regex_times.tv_sec, total_regex_times.tv_nsec, total_num_matches, total_regex_urls);
+					log_message(LOG_INFO, "Total regex time %" PRI_ts_sec ".%9.9" PRI_ts_nsec ", num match calls %u, num url checks %u", total_regex_times.tv_sec, total_regex_times.tv_nsec, total_num_matches, total_regex_urls);
 #endif
 			}
 		}
@@ -216,7 +225,7 @@ format_digest(const uint8_t *digest, char *buf)
 }
 
 static void
-dump_url(FILE *fp, const url_t *url)
+dump_url(FILE *fp, bool is_ssl, const url_t *url)
 {
 	char digest_buf[2 * MD5_DIGEST_LENGTH + 1];
 	unsigned int i = 0;
@@ -225,6 +234,8 @@ dump_url(FILE *fp, const url_t *url)
 	conf_write(fp, "   Checked url = %s", url->path);
 	if (url->digest)
 		conf_write(fp, "     digest = %s", format_digest(url->digest, digest_buf));
+	if (is_ssl)
+		conf_write(fp, "     tls_compliant %sset", url->tls_compliant ? "" : "un");
 
 	conf_write(fp, "     HTTP Status Code(s)");
 	for (i = HTTP_STATUS_CODE_MIN; i <= HTTP_STATUS_CODE_MAX; i++) {
@@ -248,10 +259,12 @@ dump_url(FILE *fp, const url_t *url)
 
 	if (url->virtualhost)
 		conf_write(fp, "     Virtual host = %s", url->virtualhost);
+	if (url->last_ssl_error)
+		conf_write(fp, "     Last SSL error = 0x%lx", url->last_ssl_error);
 
 #ifdef _WITH_REGEX_CHECK_
 	if (url->regex) {
-		char options_buf[512];
+		char options_buf[512] = "";
 		char *op;
 
 		conf_write(fp, "     Regex = \"%s\"", url->regex->pattern);
@@ -263,18 +276,17 @@ dump_url(FILE *fp, const url_t *url)
 			else
 				conf_write(fp, "     Regex min offset = %zu", url->regex_min_offset);
 		}
+
 		if (url->regex->pcre2_options) {
 			op = options_buf;
 			for (i = 0; regex_options[i].option; i++) {
-				if (url->regex->pcre2_options & regex_options[i].option_bit) {
+				if (regex_options[i].option_bit) {
 					*op++ = ' ';
 					strcpy(op, regex_options[i].option);
 					op += strlen(op);
 				}
 			}
 		}
-		else
-			options_buf[0] = '\0';
 		conf_write(fp, "     Regex options:%s", options_buf);
 		conf_write(fp, "     Regex ref count = %u", url->regex->refcnt);
 #ifndef PCRE2_DONT_USE_JIT
@@ -285,12 +297,12 @@ dump_url(FILE *fp, const url_t *url)
 #endif
 }
 static void
-dump_url_list(FILE *fp, const list_head_t *l)
+dump_url_list(FILE *fp, bool is_ssl, const list_head_t *l)
 {
 	url_t *url;
 
 	list_for_each_entry(url, l, e_list)
-		dump_url(fp, url);
+		dump_url(fp, is_ssl, url);
 }
 
 static void
@@ -304,7 +316,7 @@ free_http_request(request_t *req)
 	FREE(req);
 }
 
-static void
+void
 free_http_check(checker_t *checker)
 {
 	http_checker_t *http_get_chk = checker->data;
@@ -332,7 +344,9 @@ dump_http_check(FILE *fp, const checker_t *checker)
 	conf_write(fp, "   Enable SNI %sset", http_get_chk->enable_sni ? "" : "un");
 #endif
 	conf_write(fp, "   Fast recovery %sset", http_get_chk->fast_recovery ? "" : "un");
-	dump_url_list(fp, &http_get_chk->url);
+	if (http_get_chk->proto == PROTO_SSL)
+		conf_write(fp, "   tls_compliant %sset", http_get_chk->tls_compliant ? "" : "un");
+	dump_url_list(fp, http_get_chk->proto, &http_get_chk->url);
 	if (http_get_chk->failed_url)
 		conf_write(fp, "   Failed URL = %s", http_get_chk->failed_url->path);
 }
@@ -418,26 +432,51 @@ compare_http_check(const checker_t *old_c, checker_t *new_c)
 	return true;
 }
 
-static const checker_funcs_t http_checker_funcs = { CHECKER_HTTP, free_http_check, dump_http_check, compare_http_check, NULL };
+static void
+migrate_http_check(checker_t *new_c, const checker_t *old_c)
+{
+	url_t *old_url;
+	url_t *new_url;
+	http_checker_t *old_http_c;
+	http_checker_t *new_http_c;
+
+	if (new_c->is_up)
+		return;
+
+	old_http_c = CHECKER_ARG(old_c);
+	new_http_c = CHECKER_ARG(new_c);
+
+	/* For the real servers to be the same, the checkers must match,
+	 * which means that the urls match */
+	new_url = list_first_entry(&new_http_c->url, url_t, e_list);
+	list_for_each_entry(old_url, &old_http_c->url, e_list) {
+		if (old_url == old_http_c->failed_url) {
+			new_http_c->failed_url = new_url;
+			return;
+		}
+
+		new_url = list_entry(new_url->e_list.next, url_t, e_list);
+	}
+}
+
+static const checker_funcs_t http_checker_funcs = { CHECKER_HTTP, free_http_check, dump_http_check, compare_http_check, migrate_http_check };
 
 /* Configuration stream handling */
 static void
 http_get_handler(const vector_t *strvec)
 {
-	checker_t *checker;
 	http_checker_t *http_get_chk;
 	const char *str = strvec_slot(strvec, 0);
 
 	/* queue new checker */
 	http_get_chk = alloc_http_get(str);
-	checker = queue_checker(&http_checker_funcs, http_connect_thread, http_get_chk, CHECKER_NEW_CO(), true);
-	checker->default_delay_before_retry = 3 * TIMER_HZ;
+	queue_checker(&http_checker_funcs, http_connect_thread, http_get_chk, CHECKER_NEW_CO(), true);
+	current_checker->default_delay_before_retry = 3 * TIMER_HZ;
 }
 
 static void
 http_get_retry_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
 	unsigned retry;
 
 	report_config_error(CONFIG_GENERAL_ERROR, "nb_get_retry is deprecated - please use 'retry'");
@@ -447,69 +486,60 @@ http_get_retry_handler(const vector_t *strvec)
 		return;
 	}
 
-	checker->retry = retry;
+	current_checker->retry = retry;
 }
 
 static void
 virtualhost_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
+	http_checker_t *http_get_chk = current_checker->data;
 
 	if (vector_size(strvec) < 2) {
 		report_config_error(CONFIG_GENERAL_ERROR, "HTTP_GET virtualhost name missing");
 		return;
 	}
 
-	http_get_chk->virtualhost = set_value(strvec);
+	set_string(&http_get_chk->virtualhost, strvec, "virtualhost");
 }
 
 static void
 http_get_check_end(void)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
+	http_checker_t *http_get_chk = current_checker->data;
 
 	if (list_empty(&http_get_chk->url)) {
 		report_config_error(CONFIG_GENERAL_ERROR, "HTTP/SSL_GET checker has no urls specified - ignoring");
 		dequeue_new_checker();
+		return;
 	}
 
-	if (!check_conn_opts(CHECKER_GET_CO())) {
+	if (!check_conn_opts(current_checker->co)) {
 		dequeue_new_checker();
+		return;
 	}
 }
 
 static void
 url_handler(__attribute__((unused)) const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *new;
-
 	/* allocate the new URL */
-	PMALLOC(new);
-	INIT_LIST_HEAD(&new->e_list);
-	list_add_tail(&new->e_list, &http_get_chk->url);
+	PMALLOC(current_url);
+	INIT_LIST_HEAD(&current_url->e_list);
 
 #ifdef _WITH_REGEX_CHECK_
 	conf_regex_options = 0;
 #endif
-
-	http_get_chk->url_it = list_first_entry(&http_get_chk->url, url_t, e_list);
 }
 
 static void
 path_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
-
-	url->path = set_value(strvec);
+	set_string(&current_url->path, strvec, "path");
 }
 
 static void
 digest_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
 	char *digest;
 	char *endptr;
 	int i;
@@ -517,7 +547,7 @@ digest_handler(const vector_t *strvec)
 
 	digest = STRDUP(strvec_slot(strvec, 1));
 
-	if (url->digest) {
+	if (current_url->digest) {
 		report_config_error(CONFIG_GENERAL_ERROR, "Digest '%s' is a duplicate", digest);
 		FREE(digest);
 		return;
@@ -542,7 +572,7 @@ digest_handler(const vector_t *strvec)
 		}
 	}
 
-	url->digest = digest_buf;
+	current_url->digest = digest_buf;
 
 	FREE_CONST(digest);
 }
@@ -550,8 +580,6 @@ digest_handler(const vector_t *strvec)
 static void
 status_code_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
 	const char *str;
 	unsigned int i, j;
 	char *endptr;
@@ -574,28 +602,40 @@ status_code_handler(const vector_t *strvec)
 		}
 
 		for (j = min; j <= max; j++)
-			__set_bit_array(j - HTTP_STATUS_CODE_MIN, url->status_code);
+			__set_bit_array(j - HTTP_STATUS_CODE_MIN, current_url->status_code);
 	}
 }
 
 static void
 url_virtualhost_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
-
 	if (vector_size(strvec) < 2) {
 		report_config_error(CONFIG_GENERAL_ERROR, "Missing HTTP_GET virtualhost name");
 		return;
 	}
 
-	url->virtualhost = set_value(strvec);
+	set_string(&current_url->virtualhost, strvec, "url virtualhost");
+}
+
+static void
+url_tls_compliant_handler(const vector_t *strvec)
+{
+	int res = true;
+
+	if (vector_size(strvec) >= 2) {
+		res = check_true_false(strvec_slot(strvec, 1));
+		if (res == -1) {
+			report_config_error(CONFIG_GENERAL_ERROR, "Invalid tls_compliant option %s", strvec_slot(strvec, 1));
+			return;
+		}
+	}
+	current_url->tls_compliant = res;
 }
 
 static void
 http_protocol_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
+	http_checker_t *http_get_chk = current_checker->data;
 
 	if (vector_size(strvec) < 2) {
 		report_config_error(CONFIG_GENERAL_ERROR, "Missing http_protocol version");
@@ -622,9 +662,14 @@ regex_handler(__attribute__((unused)) const vector_t *strvec)
 	const vector_t *strvec_qe = alloc_strvec_quoted_escaped(NULL);
 
 	if (vector_size(strvec_qe) != 2) {
-		log_message(LOG_INFO, "regex missing or too many fields");
+		report_config_error(CONFIG_GENERAL_ERROR, "regex missing or too many fields");
 		free_strvec(strvec_qe);
 		return;
+	}
+
+	if (conf_regex_pattern) {
+		report_config_error(CONFIG_GENERAL_ERROR, "Duplicate regex specified - replacing %s with %s", conf_regex_pattern, strvec_slot(strvec, 1));
+		FREE_CONST_PTR(conf_regex_pattern);
 	}
 
 	conf_regex_pattern = PTR_CAST_CONST(unsigned char, set_value(strvec_qe));
@@ -634,10 +679,7 @@ regex_handler(__attribute__((unused)) const vector_t *strvec)
 static void
 regex_no_match_handler(__attribute__((unused)) const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
-
-	url->regex_no_match = true;
+	current_url->regex_no_match = true;
 }
 
 static void
@@ -681,28 +723,20 @@ regex_offset_handler(const vector_t *strvec, const char *type)
 static void
 regex_min_offset_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
-
-	url->regex_min_offset = regex_offset_handler(strvec, "min");
+	current_url->regex_min_offset = regex_offset_handler(strvec, "min");
 }
 
 static void
 regex_max_offset_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
-
 	/* regex_max_offset is one beyond last acceptable position */
-	url->regex_max_offset = regex_offset_handler(strvec, "max") + 1;
+	current_url->regex_max_offset = regex_offset_handler(strvec, "max") + 1;
 }
 
 #ifndef PCRE2_DONT_USE_JIT
 static void
 regex_stack_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
 	unsigned long stack_start, stack_max;
 	char *endptr;
 
@@ -732,7 +766,7 @@ regex_stack_handler(const vector_t *strvec)
 		jit_stack_start = stack_start;
 	if (stack_max > jit_stack_max)
 		jit_stack_max = stack_max;
-	url->regex_use_stack = true;
+	current_url->regex_use_stack = true;
 }
 #endif
 
@@ -803,7 +837,7 @@ prepare_regex(url_t *url)
 static void
 enable_sni_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
+	http_checker_t *http_get_chk = current_checker->data;
 	int res = true;
 
 	if (vector_size(strvec) >= 2) {
@@ -820,7 +854,7 @@ enable_sni_handler(const vector_t *strvec)
 static void
 fast_recovery_handler(const vector_t *strvec)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
+	http_checker_t *http_get_chk = current_checker->data;
 	int res = true;
 
 	if (vector_size(strvec) >= 2) {
@@ -834,61 +868,84 @@ fast_recovery_handler(const vector_t *strvec)
 }
 
 static void
+tls_compliant_handler(const vector_t *strvec)
+{
+	http_checker_t *http_get_chk = current_checker->data;
+	int res = true;
+
+	if (vector_size(strvec) >= 2) {
+		res = check_true_false(strvec_slot(strvec, 1));
+		if (res == -1) {
+			report_config_error(CONFIG_GENERAL_ERROR, "Invalid tls_compliant option %s", strvec_slot(strvec, 1));
+			return;
+		}
+	}
+	http_get_chk->tls_compliant = res;
+}
+
+static void
 url_check(void)
 {
-	http_checker_t *http_get_chk = CHECKER_GET();
-	url_t *url = list_last_entry(&http_get_chk->url, url_t, e_list);
 	unsigned i;
+	http_checker_t *http_get_chk = current_checker->data;
 
-	if (!url->path) {
+
+	if (!current_url->path) {
 		report_config_error(CONFIG_GENERAL_ERROR, "HTTP/SSL_GET checker url has no path - ignoring");
-		free_url(url);
+		free_url(current_url);
 		return;
 	}
 
 	/* Set default status codes if none set */
-	for (i = 0; i < sizeof(url->status_code) / sizeof(url->status_code[0]); i++) {
-		if (url->status_code[i])
+	for (i = 0; i < sizeof(current_url->status_code) / sizeof(current_url->status_code[0]); i++) {
+		if (current_url->status_code[i])
 			break;
 	}
-	if (i >= sizeof(url->status_code) / sizeof(url->status_code[0])) {
+	if (i >= sizeof(current_url->status_code) / sizeof(current_url->status_code[0])) {
 		for (i = HTTP_DEFAULT_STATUS_CODE_MIN; i <= HTTP_DEFAULT_STATUS_CODE_MAX; i++)
-			__set_bit_array(i - HTTP_STATUS_CODE_MIN, url->status_code);
+			__set_bit_array(i - HTTP_STATUS_CODE_MIN, current_url->status_code);
 	}
 
 #ifdef _WITH_REGEX_CHECK_
 	if (conf_regex_pattern)
-		prepare_regex(url);
+		prepare_regex(current_url);
 	else if (conf_regex_options
-		 || url->regex_no_match
-		 || url->regex_min_offset
-		 || url->regex_max_offset
+		 || current_url->regex_no_match
+		 || current_url->regex_min_offset
+		 || current_url->regex_max_offset
 #ifndef PCRE2_DONT_USE_JIT
-		 || url->regex_use_stack
+		 || current_url->regex_use_stack
 #endif
 					 ) {
 		log_message(LOG_INFO, "regex parameters specified without regex");
 		conf_regex_options = 0;
-		url->regex_no_match = false;
-		url->regex_min_offset = 0;
-		url->regex_max_offset = 0;
+		current_url->regex_no_match = false;
+		current_url->regex_min_offset = 0;
+		current_url->regex_max_offset = 0;
 #ifndef PCRE2_DONT_USE_JIT
-		url->regex_use_stack = false;
+		current_url->regex_use_stack = false;
 #endif
 	}
 
-	if (url->regex_max_offset && url->regex_min_offset >= url->regex_max_offset) {
-		log_message(LOG_INFO, "regex min offset %zu > regex_max_offset %zu - ignoring", url->regex_min_offset, url->regex_max_offset - 1);
-		url->regex_min_offset = url->regex_max_offset = 0;
+	if (current_url->regex_max_offset && current_url->regex_min_offset >= current_url->regex_max_offset) {
+		log_message(LOG_INFO, "regex min offset %zu > regex_max_offset %zu - ignoring", current_url->regex_min_offset, current_url->regex_max_offset - 1);
+		current_url->regex_min_offset = current_url->regex_max_offset = 0;
 	}
 #endif
+
+	list_add_tail(&current_url->e_list, &http_get_chk->url);
+	if (!http_get_chk->url_it)
+		http_get_chk->url_it = current_url;
 }
 
 static void
 install_http_ssl_check_keyword(const char *keyword)
 {
+	vpp_t check_ptr;
+	vpp_t check_ptr1;
+
 	install_keyword(keyword, &http_get_handler);
-	install_sublevel();
+	check_ptr = install_sublevel(VPP &current_checker);
 	install_checker_common_keywords(true);
 	install_keyword("nb_get_retry", &http_get_retry_handler);	/* Deprecated */
 	install_keyword("virtualhost", &virtualhost_handler);
@@ -897,8 +954,10 @@ install_http_ssl_check_keyword(const char *keyword)
 	install_keyword("enable_sni", &enable_sni_handler);
 #endif
 	install_keyword("fast_recovery", &fast_recovery_handler);
+	if (!strcmp(keyword, "SSL_GET"))
+		install_keyword("tls_compliant", &tls_compliant_handler);
 	install_keyword("url", &url_handler);
-	install_sublevel();
+	check_ptr1 = install_sublevel(VPP &current_url);
 	install_keyword("path", &path_handler);
 	install_keyword("digest", &digest_handler);
 	install_keyword("status_code", &status_code_handler);
@@ -913,10 +972,12 @@ install_http_ssl_check_keyword(const char *keyword)
 	install_keyword("regex_stack", &regex_stack_handler);
 #endif
 #endif
-	install_sublevel_end_handler(url_check);
-	install_sublevel_end();
-	install_sublevel_end_handler(http_get_check_end);
-	install_sublevel_end();
+	if (!strcmp(keyword, "SSL_GET"))
+		install_keyword("tls_compliant", &url_tls_compliant_handler);
+	install_level_end_handler(url_check);
+	install_sublevel_end(check_ptr1);
+	install_level_end_handler(http_get_check_end);
+	install_sublevel_end(check_ptr);
 }
 
 void
@@ -945,7 +1006,7 @@ install_ssl_check_keyword(void)
  *            v
  *     http_check_thread (handle SSL connect)
  *            v
- *     http_request_thread (send SSL GET request)
+ *     http_request (send SSL GET request)
  *            v
  *     http_response_thread (initialize read stream step)
  *         /             \
@@ -1016,12 +1077,14 @@ epilog(thread_ref_t thread, register_checker_t method)
 		if (checker->is_up || !checker->has_run) {
 			if (checker->has_run && checker->retry)
 				log_message(LOG_INFO
-				   , "HTTP_CHECK on service %s failed after %u retries."
+				   , "%s_CHECK on service %s failed after %u retries."
+				   , (http_get_check->proto == PROTO_SSL) ? "SSL" : "HTTP"
 				   , FMT_CHK(checker)
 				   , checker->retry_it - 1);
 			else
 				log_message(LOG_INFO
-				   , "HTTP_CHECK on service %s failed."
+				   , "%s_CHECK on service %s failed."
+				   , (http_get_check->proto == PROTO_SSL) ? "SSL" : "HTTP"
 				   , FMT_CHK(checker));
 			checker_was_up = checker->is_up;
 			rs_was_alive = checker->rs->alive;
@@ -1030,7 +1093,7 @@ epilog(thread_ref_t thread, register_checker_t method)
 			    (rs_was_alive != checker->rs->alive || !global_data->no_checker_emails))
 				smtp_alert(SMTP_MSG_RS, checker, NULL,
 					   "=> CHECK failed on service"
-					   " : HTTP request failed <=");
+					   " : HTTP/SSL request failed <=");
 		}
 
 		/* Mark we have a failed URL */
@@ -1081,6 +1144,11 @@ timeout_epilog(thread_ref_t thread, const char *debug_msg)
 
 	/* check if server is currently alive */
 	if (checker->is_up || !checker->has_run) {
+		if (((http_checker_t *)checker->data)->genhash_flags & GENHASH) {
+			printf("%s\n", debug_msg);
+			thread_add_terminate_event(thread->master);
+			return;
+		}
 		if (global_data->checker_log_all_failures || checker->log_all_failures)
 			log_message(LOG_INFO, "%s server %s."
 					    , debug_msg
@@ -1278,15 +1346,29 @@ check_regex(url_t *url, request_t *req)
 
 /* Handle response */
 void
-http_handle_response(thread_ref_t thread, unsigned char digest[MD5_DIGEST_LENGTH]
-		     , bool empty_buffer)
+http_handle_response(thread_ref_t thread, unsigned char digest[MD5_DIGEST_LENGTH],
+		     bool empty_buffer)
 {
 	checker_t *checker = THREAD_ARG(thread);
 	http_checker_t *http_get_check = CHECKER_ARG(checker);
 	request_t *req = http_get_check->req;
-	int r;
 	url_t *url = fetch_next_url(http_get_check);
 	const char *msg = "HTTP status code";
+	int r;
+
+	/* Genhash mode ? */
+	if (http_get_check->genhash_flags) {
+		if (empty_buffer) {
+			fprintf(stderr, "no data received from remote webserver\n");
+		} else {
+			for (r = 0; r < MD5_DIGEST_LENGTH; r++)
+				printf("%02x", digest[r]);
+			printf("\n");
+		}
+
+		thread_add_terminate_event(thread->master);
+		return;
+	}
 
 	/* First check if remote webserver returned data */
 	if (empty_buffer) {
@@ -1305,13 +1387,15 @@ http_handle_response(thread_ref_t thread, unsigned char digest[MD5_DIGEST_LENGTH
 	/* Report a length mismatch the first time we get the specific difference */
 	if (req->content_len != SIZE_MAX && req->content_len != req->rx_bytes) {
 		if (url->len_mismatch != (ssize_t)req->content_len - (ssize_t)req->rx_bytes) {
-			log_message(LOG_INFO, "http_check for RS %s VS %s url %s%s: content_length (%zu) does not match received bytes (%zu)",
-				    FMT_RS(checker->rs, checker->vs), FMT_VS(checker->vs), url->virtualhost ? url->virtualhost : "",
-				    url->path, req->content_len, req->rx_bytes);
+			log_message(LOG_INFO, "http_check for RS %s VS %s url %s%s:"
+					      " content_length (%zu) does not match received bytes (%zu)"
+					    , FMT_RS(checker->rs, checker->vs)
+					    , FMT_VS(checker->vs)
+					    , url->virtualhost ? url->virtualhost : ""
+					    , url->path, req->content_len, req->rx_bytes);
 			url->len_mismatch = (ssize_t)req->content_len - (ssize_t)req->rx_bytes;
 		}
-	}
-	else
+	} else
 		url->len_mismatch = 0;
 
 	/* Continue with MD5SUM */
@@ -1360,24 +1444,56 @@ http_handle_response(thread_ref_t thread, unsigned char digest[MD5_DIGEST_LENGTH
 	epilog(thread, REGISTER_CHECKER_NEW);
 }
 
+/* Dump HTTP header */
+static void
+http_dump_header(char *buffer, size_t size)
+{
+        dump_buffer(buffer, size, stdout, 0);
+        printf(HTTP_HEADER_ASCII);
+        printf("%.*s\n", (int)size, buffer);
+}
+
+void
+dump_digest(unsigned char *digest, unsigned len)
+{
+	printf("\n");
+	printf(HTML_HASH);
+	dump_buffer(PTR_CAST(char, digest), len, stdout, 0);
+
+	printf(HTML_HASH_FINAL);
+}
+
 /* Handle response stream performing MD5 updates */
 void
-http_process_response(request_t *req, size_t r, url_t *url)
+http_process_response(thread_ref_t thread, request_t *req, size_t r, url_t *url)
 {
 	size_t old_req_len = req->len;
+	checker_t *checker = THREAD_ARG(thread);
+	http_checker_t *http_get_check = CHECKER_ARG(checker);
 
 	req->len += r;
 	req->buffer[req->len] = '\0';	/* Terminate the received data since it is used as a string */
 
 	if (!req->extracted) {
+		if (http_get_check->genhash_flags & GENHASH_VERBOSE)
+			printf(HTTP_HEADER_HEXA);
 		if ((req->extracted = extract_html(req->buffer, req->len))) {
 			req->status_code = extract_status_code(req->buffer, req->len);
 			req->content_len = extract_content_length(req->buffer, req->len);
+
+			if (http_get_check->genhash_flags & GENHASH_VERBOSE)
+                                http_dump_header(req->buffer, req->extracted - req->buffer);
+
 			r = req->len - (size_t)(req->extracted - req->buffer);
 			if (r && url->digest) {
-				if (req->content_len == SIZE_MAX || req->content_len > req->rx_bytes)
-					MD5_Update(&req->context, req->extracted,
+				if (req->content_len == SIZE_MAX || req->content_len > req->rx_bytes) {
+					EVP_DigestUpdate(req->context, req->extracted,
 						   req->content_len == SIZE_MAX || req->content_len >= req->rx_bytes + r ? r : req->content_len - req->rx_bytes);
+					if (http_get_check->genhash_flags & GENHASH_VERBOSE) {
+						printf(HTML_HEADER_HEXA);
+						dump_buffer(req->extracted, req->content_len == SIZE_MAX || req->content_len >= req->rx_bytes + r ? r : req->content_len - req->rx_bytes, stdout, 0);
+					}
+				}
 			}
 
 			req->rx_bytes = r;
@@ -1389,8 +1505,10 @@ http_process_response(request_t *req, size_t r, url_t *url)
 	} else if (req->len) {
 		if (url->digest &&
 		    (req->content_len == SIZE_MAX || req->content_len > req->rx_bytes)) {
-			MD5_Update(&req->context, req->buffer + old_req_len,
+			EVP_DigestUpdate(req->context, req->buffer + old_req_len,
 				   req->content_len == SIZE_MAX || req->content_len >= req->rx_bytes + r ? r : req->content_len - req->rx_bytes);
+			if (http_get_check->genhash_flags & GENHASH_VERBOSE)
+				dump_buffer(req->buffer + old_req_len, req->content_len == SIZE_MAX || req->content_len >= req->rx_bytes + r ? r : req->content_len - req->rx_bytes, stdout, 0);
 		}
 
 		req->rx_bytes += req->len;
@@ -1429,14 +1547,20 @@ http_read_thread(thread_ref_t thread)
 				    , FMT_CHK(checker)
 				    , strerror(errno));
 		thread_add_read(thread->master, http_read_thread, checker,
-				thread->u.f.fd, timeout, true);
+				thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 		return;
 	}
 
 	if (r <= 0) {	/* -1:error , 0:EOF */
 		/* All the HTTP stream has been parsed */
-		if (url->digest)
-			MD5_Final(digest, &req->context);
+		if (url->digest) {
+			EVP_DigestFinal_ex(req->context, digest, NULL);
+			EVP_MD_CTX_free(req->context);
+			req->context = NULL;
+			if (r == 0 && http_get_check->genhash_flags & GENHASH_VERBOSE)
+				dump_digest(digest, MD5_DIGEST_LENGTH);
+		} else
+			digest[0] = 0;
 
 		if (r == -1) {
 			/* We have encountered a real read error */
@@ -1446,17 +1570,18 @@ http_read_thread(thread_ref_t thread)
 
 		/* Handle response stream */
 		http_handle_response(thread, digest, !req->extracted);
-	} else {
-		/* Handle response stream */
-		http_process_response(req, (size_t)r, url);
-
-		/*
-		 * Register next http stream reader.
-		 * Register itself to not perturbe global I/O multiplexer.
-		 */
-		thread_add_read(thread->master, http_read_thread, checker,
-				thread->u.f.fd, timeout, true);
+		return;
 	}
+
+	/* Handle response stream */
+	http_process_response(thread, req, (size_t)r, url);
+
+	/*
+	 * Register next http stream reader.
+	 * Register itself to not perturbe global I/O multiplexer.
+	 */
+	thread_add_read(thread->master, http_read_thread, checker,
+			thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 }
 
 /*
@@ -1490,26 +1615,28 @@ http_response_thread(thread_ref_t thread)
 	req->num_match_calls = 0;
 #endif
 #endif
-	if (url->digest)
-		MD5_Init(&req->context);
+	if (url->digest) {
+		req->context = EVP_MD_CTX_new();
+		EVP_DigestInit_ex(req->context, EVP_md5(), NULL);
+	}
 
 	/* Register asynchronous http/ssl read thread */
 	if (http_get_check->proto == PROTO_SSL)
 		thread_add_read(thread->master, ssl_read_thread, checker,
-				thread->u.f.fd, timeout, true);
+				thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 	else
 		thread_add_read(thread->master, http_read_thread, checker,
-				thread->u.f.fd, timeout, true);
+				thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 }
 
 /* remote Web server is connected, send it the get url query.  */
 static void
-http_request_thread(thread_ref_t thread)
+http_request(thread_ref_t thread)
 {
 	checker_t *checker = THREAD_ARG(thread);
 	http_checker_t *http_get_check = CHECKER_ARG(checker);
 	request_t *req = http_get_check->req;
-	struct sockaddr_storage *addr = &checker->co->dst;
+	sockaddr_t *addr = &checker->co->dst;
 	unsigned timeout = checker->co->connection_to;
 	const char *vhost;
 	const char *request_host;
@@ -1517,12 +1644,6 @@ http_request_thread(thread_ref_t thread)
 	char *str_request;
 	url_t *fetched_url;
 	int ret = 0;
-
-	/* Handle write timeout */
-	if (thread->type == THREAD_WRITE_TIMEOUT) {
-		timeout_epilog(thread, "Timeout WEB write");
-		return;
-	}
 
 	/* Allocate & clean the GET string */
 	str_request = PTR_CAST(char, MALLOC(GET_BUFFER_LENGTH));
@@ -1578,7 +1699,7 @@ http_request_thread(thread_ref_t thread)
 
 	/* Register read timeouted thread */
 	thread_add_read(thread->master, http_response_thread, checker,
-			thread->u.f.fd, timeout, true);
+			thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 	thread_del_write(thread);
 	return;
 }
@@ -1595,97 +1716,81 @@ http_check_thread(thread_ref_t thread)
 	int ssl_err = 0;
 	bool new_req = false;
 
-	status = tcp_socket_state(thread, http_check_thread);
-	switch (status) {
-	case connect_error:
-		timeout_epilog(thread, "Error connecting");
+	status = tcp_socket_state(thread, http_check_thread, 0);
+	if (status != connect_success) {
+		if (status == connect_error)
+			timeout_epilog(thread, "Error connecting");
+		else if (status == connect_timeout)
+			timeout_epilog(thread, "Timeout connecting");
+		else if (status == connect_fail)
+			timeout_epilog(thread, "Connection failed");
 		return;
-		break;
+	}
 
-	case connect_timeout:
-		timeout_epilog(thread, "Timeout connecting");
-		return;
-		break;
+	if (!http_get_check->req) {
+		PMALLOC(http_get_check->req);
+		new_req = true;
+	} else
+		new_req = false;
 
-	case connect_fail:
-		timeout_epilog(thread, "Connection failed");
-		return;
-		break;
+	if (http_get_check->proto == PROTO_SSL) {
+		if (thread->type == THREAD_WRITE_TIMEOUT ||
+		    thread->type == THREAD_READ_TIMEOUT)
+		{
+			timeout_epilog(thread, "Timeout connecting");
+			return;
+		}
 
-	case connect_success:
-		if (!http_get_check->req) {
-			PMALLOC(http_get_check->req);
-			new_req = true;
-		} else
-			new_req = false;
-
-		if (http_get_check->proto == PROTO_SSL) {
+		ret = ssl_connect(thread, new_req);
+		if (ret < 0) {
 			timeout = timer_long(thread->sands) - timer_long(time_now);
-			if (thread->type != THREAD_WRITE_TIMEOUT &&
-			    thread->type != THREAD_READ_TIMEOUT)
-				ret = ssl_connect(thread, new_req);
-			else {
-				timeout_epilog(thread, "Timeout connecting");
+			ssl_err = SSL_get_error(http_get_check->req->ssl, ret);
+			if (ssl_err == SSL_ERROR_WANT_READ) {
+				thread_add_read(thread->master,
+						http_check_thread,
+						THREAD_ARG(thread),
+						thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
+				thread_del_write(thread);
 				return;
 			}
 
-			if (ret == -1) {
-				switch ((ssl_err = SSL_get_error(http_get_check->req->ssl,
-								 ret))) {
-				case SSL_ERROR_WANT_READ:
-					thread_add_read(thread->master,
-							http_check_thread,
-							THREAD_ARG(thread),
-							thread->u.f.fd, timeout, true);
-					thread_del_write(thread);
-					break;
-				case SSL_ERROR_WANT_WRITE:
-					thread_add_write(thread->master,
-							 http_check_thread,
-							 THREAD_ARG(thread),
-							 thread->u.f.fd, timeout, true);
-					thread_del_read(thread);
-					break;
-				default:
-					ret = 0;
-					break;
-				}
-				if (ret == -1)
-					break;
-			} else if (ret != 1)
-				ret = 0;
-		}
+			if (ssl_err == SSL_ERROR_WANT_WRITE) {
+				thread_add_write(thread->master,
+						 http_check_thread,
+						 THREAD_ARG(thread),
+						 thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
+				thread_del_read(thread);
+				return;
+			}
 
-		if (ret) {
-			/* Remote WEB server is connected.
-			 * Register the next step thread ssl_request_thread.
-			 */
-#ifdef _CHECKER_DEBUG_
-			if (do_checker_debug)
-				log_message(LOG_DEBUG, "Remote Web server %s connected.", FMT_CHK(checker));
-#endif
-			thread_add_write(thread->master,
-					 http_request_thread, checker,
-					 thread->u.f.fd,
-					 checker->co->connection_to, true);
-			thread_del_read(thread);
-		} else {
-#ifdef _CHECKER_DEBUG_
-			if (do_checker_debug)
-				log_message(LOG_DEBUG, "Connection trouble to: %s." , FMT_CHK(checker));
+			ret = 0;
+		} else if (ret != 1)
+			ret = 0;
+	}
 
-			if (http_get_check->proto == PROTO_SSL)
-				ssl_printerr(SSL_get_error (http_get_check->req->ssl, ret));
+	if (ret) {
+		/* Remote WEB server is connected.
+		 */
+#ifdef _CHECKER_DEBUG_
+		if (do_checker_debug)
+			log_message(LOG_DEBUG, "Remote Web server %s connected.", FMT_CHK(checker));
 #endif
-			timeout_epilog(thread, "SSL handshake/communication error"
-						 " connecting to");
-			return;
-		}
-		break;
+		 http_request(thread);
+	} else {
+#ifdef _CHECKER_DEBUG_
+		if (do_checker_debug)
+			log_message(LOG_DEBUG, "Connection trouble to: %s." , FMT_CHK(checker));
+
+		if (http_get_check->proto == PROTO_SSL)
+			ssl_printerr(SSL_get_error(http_get_check->req->ssl, ret));
+#endif
+		timeout_epilog(thread, "SSL handshake/communication error"
+					 " connecting to");
+		return;
 	}
 }
 
-static void
+void
 http_connect_thread(thread_ref_t thread)
 {
 	checker_t *checker = THREAD_ARG(thread);
@@ -1721,28 +1826,17 @@ http_connect_thread(thread_ref_t thread)
 		return;
 	}
 
-#if !HAVE_DECL_SOCK_NONBLOCK
-	if (set_sock_flags(fd, F_SETFL, O_NONBLOCK))
-		log_message(LOG_INFO, "Unable to set NONBLOCK on http_connect socket - %s (%d)", strerror(errno), errno);
-#endif
-
-#if !HAVE_DECL_SOCK_CLOEXEC
-	if (set_sock_flags(fd, F_SETFD, FD_CLOEXEC))
-		log_message(LOG_INFO, "Unable to set CLOEXEC on http_connect socket - %s (%d)", strerror(errno), errno);
-#endif
-
 	status = tcp_bind_connect(fd, co);
 
 	/* handle tcp connection status & register check worker thread */
-	if(tcp_connection_state(fd, status, thread, http_check_thread,
-			co->connection_to)) {
+	if (tcp_connection_state(fd, status, thread, http_check_thread, co->connection_to, 0)) {
 		close(fd);
 		if (status == connect_fail) {
-			timeout_epilog(thread, "HTTP_CHECK - network unreachable");
+			timeout_epilog(thread, "HTTP/SSL_CHECK - network unreachable");
 		} else {
 			log_message(LOG_INFO, "WEB socket bind failed. Rescheduling");
 			thread_add_timer(thread->master, http_connect_thread, checker,
-					checker->delay_loop);
+					 checker->delay_loop);
 		}
 	}
 }
@@ -1754,7 +1848,6 @@ register_check_http_addresses(void)
 	register_thread_address("http_check_thread", http_check_thread);
 	register_thread_address("http_connect_thread", http_connect_thread);
 	register_thread_address("http_read_thread", http_read_thread);
-	register_thread_address("http_request_thread", http_request_thread);
 	register_thread_address("http_response_thread", http_response_thread);
 }
 #endif

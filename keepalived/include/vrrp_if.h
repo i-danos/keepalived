@@ -45,6 +45,7 @@
 #include "scheduler.h"
 #include "list_head.h"
 #include "timer.h"
+#include "sockaddr.h"
 
 #define LINK_UP   1
 #define LINK_DOWN 0
@@ -57,7 +58,7 @@
 #define LB_ETHTOOL 0x4
 #endif
 
-/* We need a default MTU in case a vrrp instance using usicast doesn't specify an interface */
+/* We need a default MTU in case a vrrp instance using unicast doesn't specify an interface */
 #define	DEFAULT_MTU	1500
 
 /* I don't know what the correct type is.
@@ -77,9 +78,12 @@ typedef struct _garp_delay {
 	bool			have_gna_interval;	/* True if delay */
 	timeval_t		garp_next_time;		/* Time when next gratuitous ARP message can be sent */
 	timeval_t		gna_next_time;		/* Time when next gratuitous NA message can be sent */
-	int			aggregation_group;	/* Index of multi-interface group */
 
-	/* linked list member */
+	/* linked list of ip_address_t that have GARP/NAs pending */
+	list_head_t		garp_list;
+	list_head_t		gna_list;
+
+	/* linked list member of garp_delay_t */
 	list_head_t		e_list;
 } garp_delay_t;
 
@@ -133,6 +137,10 @@ typedef struct _interface {
 	list_head_t		sin6_addr_l;		/* List of extra IPv6 interface addresses - sin_addr_t */
 #endif
 	unsigned		ifi_flags;		/* Kernel flags */
+	bool			seen_up;		/* True once we have first seen the interface up */
+	thread_ref_t		flags_change_thread;
+	unsigned		up_debounce_timer;
+	unsigned		down_debounce_timer;
 	uint32_t		mtu;			/* MTU for this interface_t */
 	unsigned short		hw_type;		/* Type of hardware address */
 	u_char			hw_addr[MAX_ADDR_LEN];	/* MAC address */
@@ -145,26 +153,29 @@ typedef struct _interface {
 #ifdef _HAVE_VRRP_VMAC_
 	if_type_t		if_type;		/* interface type */
 	int			vmac_type;		/* Type of macvlan or ipvlan */
+#ifdef HAVE_DECL_IFLA_IPVLAN_FLAGS
+	int			ipvlan_flags;		/* bridge/private/vepa */
+#endif
 	ifindex_t		base_ifindex;		/* Only used at startup if we find vmac i/f before base i/f */
 #ifdef HAVE_IFLA_LINK_NETNSID
 	int			base_netns_id;		/* Network namespace of the parent interface */
 #endif
 	struct _interface	*base_ifp;		/* Base interface (if interface is a VMAC interface),
 							   otherwise the physical interface */
-#ifdef _HAVE_VRRP_VMAC_
 	bool			is_ours;		/* keepalived created the interface */
 	bool			deleting;		/* Set when we are deleting the interface */
-#endif
 	bool			seen_interface;		/* The interface has existed at some point since we started */
 	bool			changeable_type;	/* The interface type or underlying interface can be changed */
 #ifdef _HAVE_VRF_
 	ifindex_t		vrf_master_ifindex;	/* Only used at startup if we find i/f before master i/f */
 	struct _interface	*vrf_master_ifp;	/* VRF master interface - pointer to self if VRF master */
+	uint32_t		vrf_tb_id;		/* Table id of VRF */
 #endif
 	int			reset_arp_config;	/* Count of how many vrrps have changed arp parameters on interface */
 	bool			arp_ignore;		/* Original value of arp_ignore to be restored */
 	bool			arp_filter;		/* Original value of arp_filter to be restored */
 	unsigned		rp_filter;		/* < UINT_MAX if we have changed the value */
+	uint32_t		group;			/* GROUP for this interface_t */
 #endif
 	garp_delay_t		*garp_delay;		/* Delays for sending gratuitous ARP/NA */
 	timeval_t		last_gna_router_check;	/* Time we last checked if IPv6 forwarding set on interface */
@@ -226,7 +237,7 @@ extern list_head_t garp_delay;
 /* prototypes */
 extern interface_t *if_get_by_ifindex(ifindex_t) __attribute__ ((pure));
 #ifdef _HAVE_VRRP_VMAC_
-extern interface_t * if_get_by_vmac(uint8_t, int, const interface_t *) __attribute__ ((pure));
+extern interface_t * if_get_by_vmac(uint8_t, int, const interface_t *, const u_char hw_addr[ETH_ALEN]) __attribute__ ((pure));
 #endif
 extern interface_t *get_default_if(void);
 extern interface_t *if_get_by_ifname(const char *, if_lookup_t);
@@ -247,13 +258,11 @@ extern void free_interface_queue(void);
 extern void free_old_interface_queue(void);
 extern void dump_interface_queue(FILE *, list_head_t *);
 extern void reset_interface_queue(void);
-extern int if_join_vrrp_group(sa_family_t, int *, const interface_t *);
+extern int if_join_vrrp_group(sa_family_t, int *, const interface_t *, const sockaddr_t *);
 extern int if_setsockopt_bindtodevice(int *, const interface_t *);
 extern int if_setsockopt_hdrincl(int *);
 extern int if_setsockopt_ipv6_checksum(int *);
-#if HAVE_DECL_IP_MULTICAST_ALL  /* Since Linux 2.6.31 */
 extern int if_setsockopt_mcast_all(sa_family_t, int *);
-#endif
 extern int if_setsockopt_mcast_loop(sa_family_t, int *);
 extern int if_setsockopt_mcast_hops(sa_family_t, int *);
 extern int if_setsockopt_mcast_if(sa_family_t, int *, const interface_t *);

@@ -38,11 +38,10 @@
 #include "smtp.h"
 #include "utils.h"
 #include "parser.h"
-#if !HAVE_DECL_SOCK_CLOEXEC
-#include "old_socket.h"
-#endif
 #include "layer4.h"
 #include "scheduler.h"
+#include "check_parser.h"
+
 
 const dns_type_t DNS_TYPE[] = {
 	{DNS_TYPE_A, "A"},
@@ -59,6 +58,7 @@ const dns_type_t DNS_TYPE[] = {
 
 static void dns_connect_thread(thread_ref_t);
 static void dns_send_thread(thread_ref_t);
+
 
 static uint16_t __attribute__ ((pure))
 dns_type_lookup(const char *label)
@@ -112,13 +112,13 @@ dns_final(thread_ref_t thread, bool error, const char *fmt, ...)
 
 	checker_t *checker = THREAD_ARG(thread);
 
-#ifdef _CHECKER_DEBUG
+#ifdef _CHECKER_DEBUG_
 	if (do_checker_debug)
 		dns_log_message(thread, LOG_DEBUG, "final error=%d attempts=%u retry=%u", error,
 				checker->retry_it, checker->retry);
 #endif
 
-	if (thread->type != THREAD_TIMER)
+	if (thread->type != THREAD_READY_TIMER)
 		thread_close_fd(thread);
 
 	if (error) {
@@ -192,7 +192,7 @@ dns_recv_thread(thread_ref_t thread)
 	if (ret == -1) {
 		if (check_EAGAIN(errno) || check_EINTR(errno)) {
 			thread_add_read(thread->master, dns_recv_thread,
-					checker, thread->u.f.fd, timeout, true);
+					checker, thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 			return;
 		}
 		dns_final(thread, true, "failed to read socket; errno %d (%s)", errno, strerror(errno));
@@ -200,12 +200,12 @@ dns_recv_thread(thread_ref_t thread)
 	}
 
 	if (ret < (ssize_t) sizeof (r_header)) {
-#ifdef _CHECKER_DEBUG
+#ifdef _CHECKER_DEBUG_
 		if (do_checker_debug)
-			dns_log_message(thread, LOG_DEBUG, "too small message. (%ld bytes)", ret);
+			dns_log_message(thread, LOG_DEBUG, "too small message. (%zd bytes)", ret);
 #endif
 		thread_add_read(thread->master, dns_recv_thread, checker,
-				thread->u.f.fd, timeout, true);
+				thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 		return;
 	}
 
@@ -213,25 +213,25 @@ dns_recv_thread(thread_ref_t thread)
 	r_header = PTR_CAST(dns_header_t , rbuf);
 
 	if (s_header->id != r_header->id) {
-#ifdef _CHECKER_DEBUG
+#ifdef _CHECKER_DEBUG_
 		if (do_checker_debug)
 			dns_log_message(thread, LOG_DEBUG, "ID does not match. (%04x != %04x)",
 					ntohs(s_header->id), ntohs(r_header->id));
 #endif
 		thread_add_read(thread->master, dns_recv_thread, checker,
-				thread->u.f.fd, timeout, true);
+				thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 		return;
 	}
 
 	flags = ntohs(r_header->flags);
 
 	if (!DNS_QR(flags)) {
-#ifdef _CHECKER_DEBUG
+#ifdef _CHECKER_DEBUG_
 		if (do_checker_debug)
 			dns_log_message(thread, LOG_DEBUG, "receive query message?");
 #endif
 		thread_add_read(thread->master, dns_recv_thread, checker,
-				thread->u.f.fd, timeout, true);
+				thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 		return;
 	}
 
@@ -310,7 +310,7 @@ dns_send(thread_ref_t thread)
 	if (ret == -1) {
 		if (check_EAGAIN(errno) || check_EINTR(errno)) {
 			thread_add_write(thread->master, dns_send_thread,
-					 checker, thread->u.f.fd, timeout, true);
+					 checker, thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 			return;
 		}
 		dns_final(thread, true, "failed to write socket.");
@@ -322,7 +322,7 @@ dns_send(thread_ref_t thread)
 		return;
 	}
 
-	thread_add_read(thread->master, dns_recv_thread, checker, thread->u.f.fd, timeout, true);
+	thread_add_read(thread->master, dns_recv_thread, checker, thread->u.f.fd, timeout, THREAD_DESTROY_CLOSE_FD);
 
 	return;
 }
@@ -348,7 +348,7 @@ dns_check_thread(thread_ref_t thread)
 		return;
 	}
 
-	status = socket_state(thread, dns_check_thread);
+	status = socket_state(thread, dns_check_thread, 0);
 
 	/* If status = connect_in_progress, next thread is already registered.
 	 * If it is connect_success, the fd is still open.
@@ -398,20 +398,6 @@ dns_connect_thread(thread_ref_t thread)
 		return;
 	}
 
-#if !HAVE_DECL_SOCK_NONBLOCK
-	if (set_sock_flags(fd, F_SETFL, O_NONBLOCK))
-		dns_log_message(thread, LOG_INFO,
-				"unable to set NONBLOCK on socket - %s (%d)",
-				strerror(errno), errno);
-#endif
-
-#if !HAVE_DECL_SOCK_CLOEXEC
-	if (set_sock_flags(fd, F_SETFD, FD_CLOEXEC))
-		dns_log_message(thread, LOG_INFO,
-				"unable to set CLOEXEC on socket - %s (%d)",
-				strerror(errno), errno);
-#endif
-
 	status = socket_bind_connect(fd, co);
 
 	if (status == connect_success) {
@@ -432,7 +418,7 @@ dns_connect_thread(thread_ref_t thread)
 	}
 
 	/* handle connection status & register check worker thread */
-	if (socket_connection_state(fd, status, thread, dns_check_thread, co->connection_to)) {
+	if (socket_connection_state(fd, status, thread, dns_check_thread, co->connection_to, 0)) {
 		close(fd);
 		dns_log_message(thread, LOG_INFO,
 				"UDP socket bind failed. Rescheduling.");
@@ -483,24 +469,23 @@ static const checker_funcs_t dns_checker_funcs = { CHECKER_DNS, free_dns_check, 
 static void
 dns_check_handler(__attribute__((unused)) const vector_t *strvec)
 {
-	checker_t *checker;
 	dns_check_t *dns_check;
 
 	PMALLOC(dns_check);
 	dns_check->type = DNS_DEFAULT_TYPE;
-	checker = queue_checker(&dns_checker_funcs, dns_connect_thread,
+	queue_checker(&dns_checker_funcs, dns_connect_thread,
 				dns_check, CHECKER_NEW_CO(), true);
 
 	/* Set the non-standard retry time */
-	checker->default_retry = DNS_DEFAULT_RETRY;
-	checker->default_delay_before_retry = 0;	/* This will default to delay_loop */
+	current_checker->default_retry = DNS_DEFAULT_RETRY;
+	current_checker->default_delay_before_retry = 0;	/* This will default to delay_loop */
 }
 
 static void
 dns_type_handler(const vector_t *strvec)
 {
+	dns_check_t *dns_check = current_checker->data;
 	uint16_t dns_type;
-	dns_check_t *dns_check = CHECKER_GET();
 
 	dns_type = dns_type_lookup(strvec_slot(strvec, 1));
 	if (!dns_type)
@@ -513,7 +498,7 @@ dns_type_handler(const vector_t *strvec)
 static void
 dns_name_handler(const vector_t *strvec)
 {
-	dns_check_t *dns_check = CHECKER_GET();
+	dns_check_t *dns_check = current_checker->data;
 	const char *name;
 	bool name_invalid = false;
 	const char *p;
@@ -547,14 +532,13 @@ dns_name_handler(const vector_t *strvec)
 static void
 dns_check_end(void)
 {
-	dns_check_t *dns_check;
+	dns_check_t *dns_check = current_checker->data;
 
-	if (!check_conn_opts(CHECKER_GET_CO())) {
+	if (!check_conn_opts(current_checker->co)) {
 		dequeue_new_checker();
 		return;
 	}
 
-	dns_check = CHECKER_GET();
 	if (!dns_check->name)
 		dns_check->name = STRDUP(DNS_DEFAULT_NAME);
 }
@@ -562,13 +546,15 @@ dns_check_end(void)
 void
 install_dns_check_keyword(void)
 {
+	vpp_t check_ptr;
+
 	install_keyword("DNS_CHECK", &dns_check_handler);
-	install_sublevel();
+	check_ptr = install_sublevel(VPP &current_checker);
 	install_checker_common_keywords(true);
 	install_keyword("type", &dns_type_handler);
 	install_keyword("name", &dns_name_handler);
-	install_sublevel_end_handler(dns_check_end);
-	install_sublevel_end();
+	install_level_end_handler(dns_check_end);
+	install_sublevel_end(check_ptr);
 }
 
 #ifdef THREAD_DUMP

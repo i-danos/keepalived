@@ -20,8 +20,8 @@
  * Copyright (C) 2016-2017 Alexandre Cassen, <acassen@gmail.com>
  */
 
-#ifndef VRRP_DBUS_H
-#define VRRP_DBUS_H
+#ifndef _VRRP_DBUS_H
+#define _VRRP_DBUS_H
 
 /* System includes */
 #include <stdbool.h>
@@ -30,6 +30,7 @@
 #include "vrrp.h"
 #include "list_head.h"
 
+extern const char *dbus_no_interface_name;
 
 void dbus_send_state_signal(vrrp_t *);
 void dbus_remove_object(const vrrp_t *);

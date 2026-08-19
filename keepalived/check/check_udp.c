@@ -38,9 +38,7 @@
 #include "smtp.h"
 #include "utils.h"
 #include "parser.h"
-#if !HAVE_DECL_SOCK_CLOEXEC
-#include "old_socket.h"
-#endif
+#include "check_parser.h"
 
 static void udp_connect_thread(thread_ref_t);
 
@@ -103,7 +101,7 @@ udp_check_handler(__attribute__((unused)) const vector_t *strvec)
 static void
 payload_handler(const vector_t *strvec)
 {
-	udp_check_t *udp_check = CHECKER_GET();
+	udp_check_t *udp_check = current_checker->data;
 	char *hex_str;
 
 	if (vector_size(strvec) == 1) {
@@ -123,7 +121,7 @@ payload_handler(const vector_t *strvec)
 static void
 require_reply_handler(const vector_t *strvec)
 {
-	udp_check_t *udp_check = CHECKER_GET();
+	udp_check_t *udp_check = current_checker->data;
 	char *hex_str;
 
 	udp_check->require_reply = true;
@@ -143,7 +141,7 @@ require_reply_handler(const vector_t *strvec)
 static void
 min_length_handler(const vector_t *strvec)
 {
-	udp_check_t *udp_check = CHECKER_GET();
+	udp_check_t *udp_check = current_checker->data;
 	unsigned len;
 
 	if (!read_unsigned_strvec(strvec, 1, &len, 0, UINT16_MAX, false)) {
@@ -157,7 +155,7 @@ min_length_handler(const vector_t *strvec)
 static void
 max_length_handler(const vector_t *strvec)
 {
-	udp_check_t *udp_check = CHECKER_GET();
+	udp_check_t *udp_check = current_checker->data;
 	unsigned len;
 
 	if (!read_unsigned_strvec(strvec, 1, &len, 0, UINT16_MAX, false)) {
@@ -171,9 +169,9 @@ max_length_handler(const vector_t *strvec)
 static void
 udp_check_end_handler(void)
 {
-	udp_check_t *udp_check = CHECKER_GET();
+	udp_check_t *udp_check = current_checker->data;
 
-	if (!check_conn_opts(CHECKER_GET_CO())) {
+	if (!check_conn_opts(current_checker->co)) {
 		dequeue_new_checker();
 		return;
 	}
@@ -186,16 +184,18 @@ udp_check_end_handler(void)
 void
 install_udp_check_keyword(void)
 {
+	vpp_t check_ptr;
+
 	/* We don't want some common keywords */
 	install_keyword("UDP_CHECK", &udp_check_handler);
-	install_sublevel();
+	check_ptr = install_sublevel(VPP &current_checker);
 	install_checker_common_keywords(true);
 	install_keyword("payload", &payload_handler);
 	install_keyword("require_reply", &require_reply_handler);
 	install_keyword("min_reply_length", &min_length_handler);
 	install_keyword("max_reply_length", &max_length_handler);
-	install_sublevel_end_handler(udp_check_end_handler);
-	install_sublevel_end();
+	install_level_end_handler(udp_check_end_handler);
+	install_sublevel_end(check_ptr);
 }
 
 static void
@@ -294,6 +294,7 @@ udp_check_thread(thread_ref_t thread)
 	thread_close_fd(thread);
 
 	if (status == connect_success) {
+		/* coverity[var_deref_model] - udp_check->reply_data is only set if udp_check->require_reply is set */
 		if (udp_check->reply_data && check_udp_reply(recv_buf, len, udp_check)) {
 			if (checker->is_up &&
 			    (global_data->checker_log_all_failures || checker->log_all_failures))
@@ -310,7 +311,8 @@ udp_check_thread(thread_ref_t thread)
 		udp_epilog(thread, false);
 	}
 
-	FREE(recv_buf);
+	if (recv_buf)
+		FREE(recv_buf);
 
 	return;
 }
@@ -341,15 +343,6 @@ udp_connect_thread(thread_ref_t thread)
 
 		return;
 	}
-#if !HAVE_DECL_SOCK_NONBLOCK
-	if (set_sock_flags(fd, F_SETFL, O_NONBLOCK))
-		log_message(LOG_INFO, "Unable to set NONBLOCK on icmp_connect socket - %s (%d)", strerror(errno), errno);
-#endif
-
-#if !HAVE_DECL_SOCK_CLOEXEC
-	if (set_sock_flags(fd, F_SETFD, FD_CLOEXEC))
-		log_message(LOG_INFO, "Unable to set CLOEXEC on icmp_connect socket - %s (%d)", strerror(errno), errno);
-#endif
 
 	status = udp_bind_connect(fd, co, udp_check->payload, udp_check->payload_len);
 

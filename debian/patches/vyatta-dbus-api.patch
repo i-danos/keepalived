@@ -1,0 +1,545 @@
+Extend the DBus interface for the DANOS VRRP VCI
+
+vyatta-vrrp drives keepalived over DBus and needs four methods upstream does
+not provide: GetRfcMapping, ResetMaster, AddDebug and RemoveDebug. Also
+report the base interface rather than the configured one when naming DBus
+objects, so RFC-mode instances appear under the physical interface.
+
+Index: b/keepalived/core/main.c
+===================================================================
+--- a/keepalived/core/main.c
++++ b/keepalived/core/main.c
+@@ -288,6 +288,7 @@ static char mem_err_debug;
+ #ifdef _RECVMSG_DEBUG_
+ static char recvmsg_debug;
+ static char recvmsg_debug_dump;
++static char perpacket_debug;
+ #endif
+ #ifdef _EINTR_DEBUG_
+ static char eintr_debug;
+@@ -1474,6 +1475,7 @@ initialise_debug_options(void)
+ #ifdef _RECVMSG_DEBUG_
+ 	do_recvmsg_debug = !!(recvmsg_debug & mask);
+ 	do_recvmsg_debug_dump = !!(recvmsg_debug_dump & mask);
++	do_perpacket_debug = !!(perpacket_debug & mask);
+ #endif
+ #ifdef _EINTR_DEBUG_
+ 	do_eintr_debug = !!(eintr_debug & mask);
+@@ -1564,6 +1566,7 @@ set_debug_options(const char *options)
+ #ifdef _RECVMSG_DEBUG_
+ 		recvmsg_debug = all_processes;
+ 		recvmsg_debug_dump = all_processes;
++		perpacket_debug = all_processes;
+ #endif
+ #ifdef _EINTR_DEBUG_
+ 		eintr_debug = all_processes;
+@@ -1714,6 +1717,9 @@ set_debug_options(const char *options)
+ 		case 'J':
+ 			recvmsg_debug_dump = processes;
+ 			break;
++		case 'L':
++			perpacket_debug = processes;
++			break;
+ #endif
+ #ifdef _EINTR_DEBUG_
+ 		case 'I':
+@@ -1947,6 +1953,7 @@ usage(const char *prog)
+ #ifdef _RECVMSG_DEBUG_
+ 	fprintf(stderr, "                                   G - VRRP recvmsg() debug\n");
+ 	fprintf(stderr, "                                   J - VRRP recvmsg() log rx data\n");
++	fprintf(stderr, "                                   L - VRRP Per packet debug\n");
+ #endif
+ #ifdef _EINTR_DEBUG_
+ 	fprintf(stderr, "                                   I - EINTR debugging\n");
+Index: b/keepalived/dbus/org.keepalived.Vrrp1.Instance.xml
+===================================================================
+--- a/keepalived/dbus/org.keepalived.Vrrp1.Instance.xml
++++ b/keepalived/dbus/org.keepalived.Vrrp1.Instance.xml
+@@ -17,6 +17,14 @@
+ 	<method name='SendGarp'>
+ 	</method>
+ 	<!--
++	  ResetMaster:
++
++	  Resets group to BACKUP if it's MASTER.
++	-->
++	<method name='ResetMaster'>
++	</method>
++
++	<!--
+ 	  VrrpStatusChange:
+ 	  @status: numerical value defining the state.
+ 
+@@ -27,5 +35,9 @@
+ 	</signal>
+ 	<property type='(s)' name='Name' access='read' />
+ 	<property type='(us)' name='State' access='read' />
++	<property type='s' name='XmitIntf' access='read' />
++	<property type='b' name='AddressOwner' access='read' />
++	<property type='u' name='LastTransition' access='read' />
++	<property type='s' name='SyncGroup' access='read' />
+   </interface>
+ </node>
+Index: b/keepalived/dbus/org.keepalived.Vrrp1.Vrrp.xml_template
+===================================================================
+--- a/keepalived/dbus/org.keepalived.Vrrp1.Vrrp.xml_template
++++ b/keepalived/dbus/org.keepalived.Vrrp1.Vrrp.xml_template
+@@ -40,6 +40,27 @@
+ 	-->
+ 	<method name='ReloadConfig'>
+ 	</method>
++	<method name="GetRfcMapping">
++		<arg name="xmit" type="s" direction="in"/>
++		<arg name="recv" type="s" direction="out" />
++		<arg name="vrid" type="y" direction="out" />
++	</method>
++	<!--
++	  Add a debug flag, useful for Per Packet Debugging
++	  Invoke using
++	  sudo dbus-send --system --dest=org.keepalived.Vrrp1 --type=method_call /org/keepalived/Vrrp1/Vrrp  org.keepalived.Vrrp1.Vrrp.AddDebug uint32:"1"
++	-->
++	<method name='AddDebug'>
++	  <arg type='u' name='DebugFlag'/>
++	</method>
++	<!--
++	  Remove a debug flag
++	  Invoke using
++	  sudo dbus-send --system --dest=org.keepalived.Vrrp1 --type=method_call /org/keepalived/Vrrp1/Vrrp  org.keepalived.Vrrp1.Vrrp.RemoveDebug uint32:"1"
++	-->
++	<method name='RemoveDebug'>
++	  <arg type='u' name='DebugFlag'/>
++	</method>
+ C		<!--
+ C		  CreateInstance:
+ C		  @iname: unique name for the new instance.
+Index: b/keepalived/include/vrrp_notify.h
+===================================================================
+--- a/keepalived/include/vrrp_notify.h
++++ b/keepalived/include/vrrp_notify.h
+@@ -34,5 +34,6 @@ extern void send_instance_notifies(vrrp_
+ extern void send_group_notifies(vrrp_sgroup_t *);
+ extern void send_instance_priority_notifies(vrrp_t *);
+ extern void notify_shutdown(void);
++extern void vrrp_smtp_notifier(vrrp_t *);
+ 
+ #endif
+Index: b/keepalived/include/vrrp_scheduler.h
+===================================================================
+--- a/keepalived/include/vrrp_scheduler.h
++++ b/keepalived/include/vrrp_scheduler.h
+@@ -44,7 +44,7 @@ extern timeval_t vrrp_delayed_start_time
+ do {						\
+   if ((V)->sync &&				\
+       (*(VRRP_TSM[S][(V)->state].handler)))	\
+-      (*(VRRP_TSM[S][(V)->state].handler)) (V);	\
++      (*(VRRP_TSM[S][(V)->state].handler)) (V, false);	\
+ } while (0)
+ 
+ #ifdef _TSM_DEBUG_
+@@ -53,6 +53,7 @@ extern bool do_tsm_debug;
+ #ifdef _RECVMSG_DEBUG_
+ extern bool do_recvmsg_debug;
+ extern bool do_recvmsg_debug_dump;
++extern bool do_perpacket_debug;
+ #endif
+ 
+ /* extern prototypes */
+Index: b/keepalived/include/vrrp_sync.h
+===================================================================
+--- a/keepalived/include/vrrp_sync.h
++++ b/keepalived/include/vrrp_sync.h
+@@ -37,7 +37,7 @@
+ extern vrrp_t *vrrp_get_instance(char *) __attribute__ ((pure));
+ extern bool vrrp_sync_set_group(vrrp_sgroup_t *);
+ extern bool vrrp_sync_can_goto_master(vrrp_t *);
+-extern void vrrp_sync_backup(vrrp_t *);
++extern void vrrp_sync_backup(vrrp_t *, bool resign);
+ extern void vrrp_sync_master(vrrp_t *);
+ extern void vrrp_sync_fault(vrrp_t *);
+ 
+Index: b/keepalived/vrrp/vrrp_dbus.c
+===================================================================
+--- a/keepalived/vrrp/vrrp_dbus.c
++++ b/keepalived/vrrp/vrrp_dbus.c
+@@ -67,7 +67,10 @@
+ 
+ #include "vrrp_dbus.h"
+ #include "vrrp_data.h"
++#include "vrrp_notify.h"
+ #include "vrrp_print.h"
++#include "vrrp_sync.h"
++#include "vrrp_scheduler.h"
+ #include "global_data.h"
+ #include "main.h"
+ #include "logger.h"
+@@ -82,13 +85,23 @@ typedef enum dbus_action {
+ 	DBUS_PRINT_STATS,
+ 	DBUS_PRINT_STATS_CLEAR,
+ 	DBUS_RELOAD,
++	DBUS_GET_RFC_MAPPING,
+ #ifdef _WITH_DBUS_CREATE_INSTANCE_
+ 	DBUS_CREATE_INSTANCE,
+ 	DBUS_DESTROY_INSTANCE,
+ #endif
+ 	DBUS_SEND_GARP,
++	DBUS_RESET_MASTER,
+ 	DBUS_GET_NAME,
+ 	DBUS_GET_STATUS,
++	DBUS_GET_XMIT,
++	DBUS_GET_IPAO,
++	DBUS_GET_LAST_TRANSITION,
++	DBUS_GET_SYNC_GROUP,
++#ifdef _RECVMSG_DEBUG_
++	DBUS_ADD_DEBUG,
++	DBUS_REMOVE_DEBUG
++#endif
+ } dbus_action_t;
+ 
+ typedef enum dbus_error {
+@@ -97,8 +110,15 @@ typedef enum dbus_error {
+ 	DBUS_OBJECT_ALREADY_EXISTS,
+ 	DBUS_INTERFACE_TOO_LONG,
+ 	DBUS_INSTANCE_NOT_FOUND,
++	DBUS_GROUP_NOT_MASTER,
+ } dbus_error_t;
+ 
++#ifdef _RECVMSG_DEBUG_
++typedef enum debug_values {
++	PER_PACKET_DEBUG = 1,
++} debug_values_t;
++#endif
++
+ typedef struct dbus_queue_ent {
+ 	dbus_action_t action;
+ 	dbus_error_t reply;
+@@ -224,6 +244,22 @@ get_vrrp_instance(const char *ifname, in
+ 	return NULL;
+ }
+ 
++static vrrp_t *
++get_vrrp_instance_from_xmit_intf(const char *ifname)
++{
++	vrrp_t *vrrp;
++
++	list_for_each_entry(vrrp, &vrrp_data->vrrp, e_list) {
++		if (!valid_path_cmp(IF_NAME(vrrp->ifp), ifname) &&
++				valid_path_cmp(IF_NAME(IF_BASE_IFP(vrrp->ifp)), ifname)) {
++			log_message(LOG_DEBUG, "Configured interface: %s, Receiving interface: %s", IF_NAME(vrrp->ifp), IF_NAME(IF_BASE_IFP(vrrp->ifp)));
++			return vrrp;
++		}
++	}
++
++	return NULL;
++}
++
+ static gboolean
+ unregister_object(const void * const key, gpointer value, __attribute__((unused)) gpointer user_data)
+ {
+@@ -301,6 +337,8 @@ process_method_call(dbus_queue_ent_t *en
+ 		else if (ent->reply == DBUS_INSTANCE_NOT_FOUND) {
+ 			g_variant_get(ent->args, "(s)", &iname);
+ 			log_message(LOG_INFO, "Unable to find DBus requested instance %s", iname);
++		} else if (ent->reply == DBUS_GROUP_NOT_MASTER) {
++			log_message(LOG_INFO, "Dbus group is not master, can't switch");
+ 		}
+ 		else
+ 			log_message(LOG_INFO, "Unknown DBus reply %d", ent->reply);
+@@ -359,6 +397,14 @@ handle_get_property(__attribute__((unuse
+ 		action = DBUS_GET_NAME;
+ 	else if (!g_strcmp0(property_name, "State"))
+ 		action = DBUS_GET_STATUS;
++	else if (!g_strcmp0(property_name, "XmitIntf"))
++		action = DBUS_GET_XMIT;
++	else if (!g_strcmp0(property_name, "AddressOwner"))
++		action = DBUS_GET_IPAO;
++	else if (!g_strcmp0(property_name, "LastTransition"))
++		action = DBUS_GET_LAST_TRANSITION;
++	else if (!g_strcmp0(property_name, "SyncGroup"))
++		action = DBUS_GET_SYNC_GROUP;
+ 	else {
+ 		log_message(LOG_INFO, "Property %s does not exist", property_name);
+ 		return NULL;
+@@ -398,6 +444,7 @@ handle_method_call(__attribute__((unused
+ 	size_t len;
+ 	unsigned family;
+ #endif
++	char *xmit;
+ 	dbus_queue_ent_t ent;
+ 	char ifname_str[sizeof (PTR_CAST(vrrp_t, NULL))->ifp->ifname];
+ 
+@@ -421,6 +468,33 @@ handle_method_call(__attribute__((unused
+ 			g_dbus_method_invocation_return_value(invocation, NULL);
+ 			kill(getppid(), SIGHUP);
+ 		}
++		else if (g_strcmp0(method_name, "GetRfcMapping") == 0) {
++			ent.action = DBUS_GET_RFC_MAPPING;
++			g_variant_get(parameters, "(s)", &xmit);
++			ent.args = g_variant_new("(s)", xmit);
++			process_method_call(&ent);
++			g_dbus_method_invocation_return_value(invocation, ent.args);
++		}
++#ifdef _RECVMSG_DEBUG_
++		else if (g_strcmp0(method_name, "AddDebug") == 0) {
++			uint32_t debug_flag;
++			g_variant_get(parameters, "(u)", &debug_flag);
++			ent.action = DBUS_ADD_DEBUG;
++			ent.args = g_variant_new("(u)", debug_flag);
++			process_method_call(&ent);
++			g_variant_unref(ent.args);
++			g_dbus_method_invocation_return_value(invocation, NULL);
++		}
++		else if (g_strcmp0(method_name, "RemoveDebug") == 0) {
++			uint32_t debug_flag;
++			g_variant_get(parameters, "(u)", &debug_flag);
++			ent.action = DBUS_REMOVE_DEBUG;
++			ent.args = g_variant_new("(u)", debug_flag);
++			process_method_call(&ent);
++			g_variant_unref(ent.args);
++			g_dbus_method_invocation_return_value(invocation, NULL);
++		}
++#endif
+ #ifdef _WITH_DBUS_CREATE_INSTANCE_
+ 		else if (g_strcmp0(method_name, "CreateInstance") == 0) {
+ 			g_variant_get(parameters, "(ssuu)", &iname, &ifname, &ent.vrid, &family);
+@@ -470,6 +544,17 @@ handle_method_call(__attribute__((unused
+ 				g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS, "Instance '%s/%d/%s' not found", ifname_str, ent.vrid, family_str(ent.family));
+ 			else
+ 				g_dbus_method_invocation_return_value(invocation, NULL);
++		} else if (!g_strcmp0(method_name, "ResetMaster")) {
++			get_interface_ids(object_path, ifname_str, &ent.vrid, &ent.family);
++			ent.action = DBUS_RESET_MASTER;
++			ent.ifname = ifname_str;
++			process_method_call(&ent);
++			if (ent.reply == DBUS_INTERFACE_NOT_FOUND)
++				g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS, "Instance '%s/%d/%s' not found", ifname_str, ent.vrid, family_str(ent.family));
++			else if (ent.reply == DBUS_GROUP_NOT_MASTER)
++				g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS, "Instance '%s/%d/%s' is not MASTER, no reset happening", ifname_str, ent.vrid, family_str(ent.family));
++			else
++				g_dbus_method_invocation_return_value(invocation, NULL);
+ 		} else {
+ 			log_message(LOG_INFO, "Method %s has not been implemented yet", method_name);
+ 			g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR, G_DBUS_ERROR_MATCH_RULE_NOT_FOUND, "Method not implemented");
+@@ -496,6 +581,8 @@ dbus_create_object_params(const char *in
+ 	gchar *object_path;
+ 	GError *local_error = NULL;
+ 
++	log_message(LOG_INFO, "Creating dbus object for %s %d %s", interface_name, vrid, (family == AF_INET? "IPv4": "IPv6"));
++
+ 	if (g_hash_table_lookup(objects, instance_name)) {
+ 		log_message(LOG_INFO, "An object for instance %s already exists", instance_name);
+ 		return DBUS_OBJECT_ALREADY_EXISTS;
+@@ -525,7 +612,7 @@ dbus_create_object_params(const char *in
+ static void
+ dbus_create_object(vrrp_t *vrrp)
+ {
+-	dbus_create_object_params(vrrp->iname, vrrp->ifp ? IF_NAME(VRRP_CONFIGURED_IFP(vrrp)) : dbus_no_interface_name, vrrp->vrid, vrrp->family, false);
++	dbus_create_object_params(vrrp->iname, vrrp->ifp ? IF_NAME(IF_BASE_IFP(vrrp->ifp)) : dbus_no_interface_name, vrrp->vrid, vrrp->family, false);
+ }
+ 
+ static bool
+@@ -794,6 +881,7 @@ handle_dbus_msg(__attribute__((unused))
+ {
+ 	dbus_queue_ent_t *ent;
+ 	char recv_buf;
++	gchar *xmit_intf;
+ 	vrrp_t *vrrp;
+ #ifdef _WITH_DBUS_CREATE_INSTANCE_
+ 	gchar *name;
+@@ -818,6 +906,55 @@ handle_dbus_msg(__attribute__((unused))
+ 			log_message(LOG_INFO, "Printing and clearing VRRP stats on DBus request");
+ 			vrrp_print_stats(true);
+ 		}
++		else if (ent->action == DBUS_GET_RFC_MAPPING) {
++			g_variant_get(ent->args, "(s)", &xmit_intf);
++			log_message(LOG_INFO, "Finding Receive interface for interface %s",
++						xmit_intf);
++			vrrp = get_vrrp_instance_from_xmit_intf(xmit_intf);
++			if (NULL != vrrp) {
++				log_message(LOG_INFO, "Found Receive interface %s for Transmit interface %s",
++							vrrp->ifp->base_ifp->ifname, xmit_intf);
++				ent->args = g_variant_new("(sy)",
++								vrrp->ifp->base_ifp->ifname,
++								vrrp->vrid
++								);
++				ent->reply = DBUS_SUCCESS;
++			} else {
++				log_message(LOG_INFO, "%s is not an RFC interface",
++							xmit_intf);
++				ent->reply = DBUS_SUCCESS;
++				ent->args = g_variant_new("(sy)",
++								"",
++								0
++								);
++			}
++		}
++#ifdef _RECVMSG_DEBUG_
++		else if (ent->action == DBUS_ADD_DEBUG) {
++			uint32_t debug_flag;
++			g_variant_get(ent->args, "(u)", &debug_flag);
++			switch (debug_flag) {
++			case PER_PACKET_DEBUG:
++				log_message(LOG_INFO, "Turning on per packet debug logs");
++				do_perpacket_debug = true;
++				break;
++			default:
++				log_message(LOG_INFO, "Unrecognised debug flag, ignoring");
++			}
++		}
++		else if (ent->action == DBUS_REMOVE_DEBUG) {
++			uint32_t debug_flag;
++			g_variant_get(ent->args, "(u)", &debug_flag);
++			switch (debug_flag) {
++			case PER_PACKET_DEBUG:
++				log_message(LOG_INFO, "Removing per packet debug logs");
++				do_perpacket_debug = false;
++				break;
++			default:
++				log_message(LOG_INFO, "Unrecognised debug flag, ignoring");
++			}
++		}
++#endif
+ #ifdef _WITH_DBUS_CREATE_INSTANCE_
+ 		else if (ent->action == DBUS_CREATE_INSTANCE) {
+ 			g_variant_get(ent->args, "(s)", &name);
+@@ -838,8 +975,32 @@ handle_dbus_msg(__attribute__((unused))
+ 				ent->reply = DBUS_SUCCESS;
+ 			}
+ 		}
++		else if (ent->action == DBUS_RESET_MASTER) {
++			ent->reply = DBUS_INTERFACE_NOT_FOUND;
++			vrrp = get_vrrp_instance(ent->ifname, ent->vrid, ent->family);
++			if (vrrp) {
++				if (vrrp->state != VRRP_STATE_MAST) {
++					log_message(LOG_INFO, "VRRP_Instance(%s) is not master, can't reset it", vrrp->iname);
++					ent->reply = DBUS_GROUP_NOT_MASTER;
++				} else {
++					vrrp->wantstate = VRRP_STATE_BACK;
++					vrrp_state_leave_master(vrrp, true);
++					vrrp_init_instance_sands(vrrp);
++					if (vrrp->sync != NULL)
++						vrrp_sync_backup(vrrp, true);
++					else
++						vrrp_smtp_notifier(vrrp);
++					ent->reply = DBUS_SUCCESS;
++				}
++			}
++		}
++
+ 		else if (ent->action == DBUS_GET_NAME ||
+-			 ent->action == DBUS_GET_STATUS) {
++			 ent->action == DBUS_GET_STATUS ||
++			 ent->action == DBUS_GET_XMIT ||
++			 ent->action == DBUS_GET_IPAO ||
++			 ent->action == DBUS_GET_LAST_TRANSITION ||
++			 ent->action == DBUS_GET_SYNC_GROUP) {
+ 			/* we look for the vrrp instance object that corresponds to our interface and group */
+ 			ent->reply = DBUS_INTERFACE_NOT_FOUND;
+ 
+@@ -851,6 +1012,17 @@ handle_dbus_msg(__attribute__((unused))
+ 					ent->args = g_variant_new("(s)", vrrp->iname);
+ 				else if (ent->action == DBUS_GET_STATUS)
+ 					ent->args = g_variant_new("(us)", vrrp->state, state_str(vrrp->state));
++				else if (ent->action == DBUS_GET_XMIT)
++					ent->args = g_variant_new("(s)", vrrp->ifp->ifname);
++				else if (ent->action == DBUS_GET_IPAO)
++					ent->args = g_variant_new("(b)", vrrp->addr_owner);
++				else if (ent->action == DBUS_GET_LAST_TRANSITION)
++					ent->args = g_variant_new("(u)", vrrp->last_transition.tv_sec);
++				else if (ent->action == DBUS_GET_SYNC_GROUP)
++					if (vrrp->sync != NULL)
++						ent->args = g_variant_new("(s)", GROUP_NAME(vrrp->sync));
++					else
++						ent->args = g_variant_new("(s)", "");
+ 				else
+ 					ent->args = NULL;	 /* How did we get here? */
+ 				ent->reply = DBUS_SUCCESS;
+@@ -876,6 +1048,7 @@ dbus_reload(const list_head_t *o, const
+ 		bool match_found;
+ 
+ 		n_name = vrrp_n->ifp ? VRRP_CONFIGURED_IFP(vrrp_n)->ifname : dbus_no_interface_name;
++		log_message(LOG_DEBUG, "Searching for a dbus instance for %s", n_name);
+ 
+ 		/* Try and find an instance with same vrid/family/interface that existed before and now */
+ 		match_found = false;
+@@ -884,20 +1057,23 @@ dbus_reload(const list_head_t *o, const
+ 			    vrrp_n->family == vrrp_o->family &&
+ // TODO - need to match on unicast_src if no interface
+ 			    !strcmp(n_name, VRRP_CONFIGURED_IFP(vrrp_o)->ifname)) {
++				log_message(LOG_DEBUG, "Found a matching instance");
+ 				/* If the old instance exists in the new config,
+ 				 * then the dbus object will exist */
+-				if (!strcmp(vrrp_n->iname, vrrp_o->iname)) {
+-					match_found = true;
+-					g_hash_table_replace(objects, no_const_char_p(vrrp_n->iname), g_hash_table_lookup(objects, vrrp_o->iname));
+-					break;
+-				} else {
+-					gpointer instance;
+-					if ((instance = g_hash_table_lookup(objects, vrrp_o->iname))) {
++				gpointer instance;
++				if ((instance = g_hash_table_lookup(objects, vrrp_o->iname))) {
++					if (!strcmp(vrrp_n->iname, vrrp_o->iname)) {
++						log_message(LOG_DEBUG, "New instance name matches old instance name");
++						match_found = true;
++						g_hash_table_replace(objects, no_const_char_p(vrrp_n->iname), instance);
++						break;
++					} else {
++						log_message(LOG_DEBUG, "New instance name does not match old instance name");
+ 						g_hash_table_remove(objects, vrrp_o->iname);
+ 						g_hash_table_insert(objects, no_const_char_p(vrrp_n->iname), instance);
++						match_found = true;
++						break;
+ 					}
+-					match_found = true;
+-					break;
+ 				}
+ 
+ #if 0
+@@ -916,9 +1092,11 @@ dbus_reload(const list_head_t *o, const
+ 			}
+ 		}
+ 
+-		if (match_found)
++		if (match_found) {
++			log_message(LOG_DEBUG, "Match found for %s", n_name);
+ 			continue;
+-
++		}
++		log_message(LOG_DEBUG, "Creating instance for %s", n_name);
+ 		dbus_create_object(vrrp_n);
+ 	}
+ 
+Index: b/keepalived/vrrp/vrrp_notify.c
+===================================================================
+--- a/keepalived/vrrp/vrrp_notify.c
++++ b/keepalived/vrrp/vrrp_notify.c
+@@ -191,7 +191,7 @@ notify_script_exec(notify_script_t* scri
+ }
+ 
+ /* SMTP alert notifier */
+-static void
++void
+ vrrp_smtp_notifier(vrrp_t * vrrp)
+ {
+ 	if (vrrp->smtp_alert &&
+Index: b/keepalived/vrrp/vrrp_sync.c
+===================================================================
+--- a/keepalived/vrrp/vrrp_sync.c
++++ b/keepalived/vrrp/vrrp_sync.c
+@@ -138,7 +138,7 @@ vrrp_sync_can_goto_master(vrrp_t *vrrp)
+ }
+ 
+ void
+-vrrp_sync_backup(vrrp_t *vrrp)
++vrrp_sync_backup(vrrp_t *vrrp, bool resign)
+ {
+ 	vrrp_sgroup_t *sgroup = vrrp->sync;
+ 	vrrp_t *isync;
+@@ -162,7 +162,7 @@ vrrp_sync_backup(vrrp_t *vrrp)
+ 			vrrp_state_leave_fault(isync);
+ 		}
+ 		else
+-			vrrp_state_leave_master(isync, false);
++			vrrp_state_leave_master(isync, resign);
+ 		vrrp_thread_requeue_read(isync);
+ 	}
+ 

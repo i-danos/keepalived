@@ -52,6 +52,7 @@ typedef enum {
 typedef enum {
 	SCRIPT_INIT_STATE_DONE,
 	SCRIPT_INIT_STATE_INIT,
+	SCRIPT_INIT_STATE_INIT_RELOAD,
 	SCRIPT_INIT_STATE_FAILED,
 } script_init_state_t;
 
@@ -59,6 +60,7 @@ typedef enum {
 typedef struct _notify_script {
 	const char **args;	/* Script args - should be "char const * const *" */
 	int	num_args;	/* Used for notify script when adding last 4 parameters */
+	const char *path;	/* The path to the executable if different from args[0] */
 	int	flags;
 	uid_t	uid;		/* uid of user to execute script */
 	gid_t	gid;		/* gid of group to execute script */
@@ -80,18 +82,16 @@ free_notify_script(notify_script_t **script)
 	if (!*script)
 		return;
 	FREE_PTR((*script)->args);
+	FREE_CONST_PTR((*script)->path);
 	FREE_PTR(*script);
 	*script = NULL;
 }
-
-/* Default user/group for script execution */
-extern uid_t default_script_uid;
-extern gid_t default_script_gid;
 
 /* Script security enabled */
 extern bool script_security;
 
 /* prototypes */
+extern void set_symlinks(bool);
 extern const char *cmd_str_r(const notify_script_t *, char *, size_t);
 extern const char *cmd_str(const notify_script_t *);
 extern void notify_fifo_open(notify_fifo_t*, notify_fifo_t*, thread_func_t, const char *);
@@ -102,13 +102,17 @@ extern void child_killed_thread(thread_ref_t);
 extern void script_killall(thread_master_t *, int, bool);
 extern unsigned check_script_secure(notify_script_t *, magic_t);
 extern unsigned check_notify_script_secure(notify_script_t **, magic_t);
+extern void reset_default_script_user(void);
 extern bool set_default_script_user(const char *, const char *);
+extern bool get_default_script_user(uid_t *, gid_t *);
 extern bool set_script_uid_gid(const vector_t *, unsigned, uid_t *, gid_t *);
 extern void set_script_params_array(const vector_t *, notify_script_t *, unsigned);
 extern notify_script_t* notify_script_init(int, const char *);
 extern void add_script_param(notify_script_t *, const char *);
+extern void notify_free_script(notify_script_t *);
 extern void notify_resource_release(void);
 extern bool notify_script_compare(const notify_script_t *, const notify_script_t *) __attribute__ ((pure));
+extern void set_our_uid_gid(void);
 #ifdef THREAD_DUMP
 extern void register_notify_addresses(void);
 #endif

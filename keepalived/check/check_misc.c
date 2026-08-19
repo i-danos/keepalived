@@ -44,12 +44,12 @@
 #ifdef THREAD_DUMP
 #include "scheduler.h"
 #endif
+#include "check_parser.h"
 
 static void misc_check_thread(thread_ref_t);
 static void misc_check_child_thread(thread_ref_t);
 
 static bool script_user_set;
-static misc_checker_t *new_misck_checker;
 
 /* Configuration stream handling */
 static void
@@ -57,7 +57,7 @@ free_misc_check(checker_t *checker)
 {
 	misc_checker_t *misck_checker = checker->data;
 
-	FREE(misck_checker->script.args);
+	notify_free_script(&misck_checker->script);
 	FREE(misck_checker);
 	FREE(checker);
 }
@@ -69,12 +69,14 @@ dump_misc_check(FILE *fp, const checker_t *checker)
 	char time_str[26];
 
 	conf_write(fp, "   Keepalive method = MISC_CHECK");
+	if (misck_checker->script.path)
+		conf_write(fp, "   path = %s", misck_checker->script.path);
 	conf_write(fp, "   script = %s", cmd_str(&misck_checker->script));
 	conf_write(fp, "   timeout = %lu", misck_checker->timeout/TIMER_HZ);
 	conf_write(fp, "   dynamic = %s", misck_checker->dynamic ? "YES" : "NO");
 	conf_write(fp, "   uid:gid = %u:%u", misck_checker->script.uid, misck_checker->script.gid);
 	ctime_r(&misck_checker->last_ran.tv_sec, time_str);
-	conf_write(fp, "   Last ran = %ld.%6.6ld (%.24s.%6.6ld)", misck_checker->last_ran.tv_sec, misck_checker->last_ran.tv_usec, time_str, misck_checker->last_ran.tv_usec);
+	conf_write(fp, "   Last ran = %" PRI_tv_sec ".%6.6" PRI_tv_usec " (%.24s.%6.6" PRI_tv_usec ")", misck_checker->last_ran.tv_sec, misck_checker->last_ran.tv_usec, time_str, misck_checker->last_ran.tv_usec);
 	conf_write(fp, "   Last status = %u", misck_checker->last_exit_code);
 }
 
@@ -110,7 +112,7 @@ static const checker_funcs_t misc_checker_funcs = { CHECKER_MISC, free_misc_chec
 static void
 misc_check_handler(__attribute__((unused)) const vector_t *strvec)
 {
-	checker_t *checker;
+	misc_checker_t *new_misck_checker;
 
 	PMALLOC(new_misck_checker);
 	new_misck_checker->state = SCRIPT_STATE_IDLE;
@@ -118,22 +120,20 @@ misc_check_handler(__attribute__((unused)) const vector_t *strvec)
 	script_user_set = false;
 
 	/* queue new checker */
-	checker = queue_checker(&misc_checker_funcs, misc_check_thread, new_misck_checker, NULL, false);
+	queue_checker(&misc_checker_funcs, misc_check_thread, new_misck_checker, NULL, false);
 
 	/* Set non-standard default value */
-	checker->default_retry = 0;
+	current_checker->default_retry = 0;
 }
 
 static void
 misc_path_handler(__attribute__((unused)) const vector_t *strvec)
 {
 	const vector_t *strvec_qe;
-
-	if (!new_misck_checker)
-		return;
+	misc_checker_t *new_misck_checker = current_checker->data;
 
 	/* We need to allow quoted and escaped strings for the script and parameters */
-	strvec_qe = alloc_strvec_quoted_escaped(NULL);
+	strvec_qe = alloc_strvec_quoted(NULL);
 
 	set_script_params_array(strvec_qe, &new_misck_checker->script, 0);
 
@@ -144,9 +144,7 @@ static void
 misc_timeout_handler(const vector_t *strvec)
 {
 	unsigned timeout;
-
-	if (!new_misck_checker)
-		return;
+	misc_checker_t *new_misck_checker = current_checker->data;
 
 	if (!read_unsigned_strvec(strvec, 1, &timeout, 0, UINT_MAX / TIMER_HZ, true)) {
 		report_config_error(CONFIG_GENERAL_ERROR, "Invalid misc_timeout value '%s'", strvec_slot(strvec, 1));
@@ -159,8 +157,7 @@ misc_timeout_handler(const vector_t *strvec)
 static void
 misc_dynamic_handler(__attribute__((unused)) const vector_t *strvec)
 {
-	if (!new_misck_checker)
-		return;
+	misc_checker_t *new_misck_checker = current_checker->data;
 
 	new_misck_checker->dynamic = true;
 }
@@ -168,8 +165,7 @@ misc_dynamic_handler(__attribute__((unused)) const vector_t *strvec)
 static void
 misc_user_handler(const vector_t *strvec)
 {
-	if (!new_misck_checker)
-		return;
+	misc_checker_t *new_misck_checker = current_checker->data;
 
 	if (vector_size(strvec) < 2) {
 		report_config_error(CONFIG_GENERAL_ERROR, "No user specified for misc checker script %s", cmd_str(&new_misck_checker->script));
@@ -179,8 +175,6 @@ misc_user_handler(const vector_t *strvec)
 	if (set_script_uid_gid(strvec, 1, &new_misck_checker->script.uid, &new_misck_checker->script.gid)) {
 		report_config_error(CONFIG_GENERAL_ERROR, "Failed to set uid/gid for misc checker script %s - removing", cmd_str(&new_misck_checker->script));
 		dequeue_new_checker();
-		FREE(new_misck_checker);
-		new_misck_checker = NULL;
 	}
 	else
 		script_user_set = true;
@@ -189,80 +183,80 @@ misc_user_handler(const vector_t *strvec)
 static void
 misc_end_handler(void)
 {
-	if (!new_misck_checker)
-		return;
+	misc_checker_t *new_misck_checker = current_checker->data;
 
 	if (!new_misck_checker->script.args) {
 		report_config_error(CONFIG_GENERAL_ERROR, "No script path has been specified for MISC_CHECKER - skipping");
 		dequeue_new_checker();
-		new_misck_checker = NULL;
 		return;
 	}
 
 	if (!script_user_set)
 	{
-		if (set_default_script_user(NULL, NULL)) {
+		if (get_default_script_user(&new_misck_checker->script.uid, &new_misck_checker->script.gid)) {
 			report_config_error(CONFIG_GENERAL_ERROR, "Unable to set default user for misc script %s - removing", cmd_str(&new_misck_checker->script));
-			FREE(new_misck_checker);
-			new_misck_checker = NULL;
+			dequeue_new_checker();
 			return;
 		}
-
-		new_misck_checker->script.uid = default_script_uid;
-		new_misck_checker->script.gid = default_script_gid;
 	}
-
-	new_misck_checker = NULL;
 }
 
 void
 install_misc_check_keyword(void)
 {
+	vpp_t check_ptr;
+
 	install_keyword("MISC_CHECK", &misc_check_handler);
-	install_sublevel();
+	check_ptr = install_sublevel(VPP &current_checker);
 	install_checker_common_keywords(false);
-	install_keyword("misc_path", &misc_path_handler);
+	install_keyword_quoted("misc_path", &misc_path_handler);
 	install_keyword("misc_timeout", &misc_timeout_handler);
 	install_keyword("misc_dynamic", &misc_dynamic_handler);
 	install_keyword("user", &misc_user_handler);
-	install_sublevel_end_handler(&misc_end_handler);
-	install_sublevel_end();
+	install_level_end_handler(&misc_end_handler);
+	install_sublevel_end(check_ptr);
 }
 
 /* Check that the scripts are secure */
 unsigned
 check_misc_script_security(magic_t magic)
 {
+	virtual_server_t *vs;
+	real_server_t *rs;
 	checker_t *checker, *checker_tmp;
 	misc_checker_t *misc_script;
 	unsigned script_flags = 0;
 	unsigned flags;
 	bool insecure;
 
-	list_for_each_entry_safe(checker, checker_tmp, &checkers_queue, e_list) {
-		if (checker->launch != misc_check_thread)
-			continue;
+	list_for_each_entry(vs, &check_data->vs, e_list) {
+		list_for_each_entry(rs, &vs->rs, e_list) {
+			list_for_each_entry_safe(checker, checker_tmp, &rs->checkers_list, rs_list) {
+				if (checker->launch != misc_check_thread)
+					continue;
 
-		misc_script = CHECKER_ARG(checker);
+				misc_script = CHECKER_ARG(checker);
 
-		script_flags |= (flags = check_script_secure(&misc_script->script, magic));
+				script_flags |= (flags = check_script_secure(&misc_script->script, magic));
 
-		/* Mark not to run if needs inhibiting */
-		insecure = false;
-		if (flags & SC_INHIBIT) {
-			log_message(LOG_INFO, "Disabling misc script %s due to insecure", cmd_str(&misc_script->script));
-			insecure = true;
-		}
-		else if (flags & SC_NOTFOUND) {
-			log_message(LOG_INFO, "Disabling misc script %s since not found/accessible", cmd_str(&misc_script->script));
-			insecure = true;
-		}
-		else if (!(flags & (SC_EXECUTABLE | SC_SYSTEM)))
-			insecure = true;
+				/* Mark not to run if needs inhibiting */
+				insecure = false;
+				if (flags & SC_INHIBIT) {
+					log_message(LOG_INFO, "Disabling misc script %s due to insecure", cmd_str(&misc_script->script));
+					insecure = true;
+				}
+				else if (flags & SC_NOTFOUND) {
+					log_message(LOG_INFO, "Disabling misc script %s since not found/accessible", cmd_str(&misc_script->script));
+					insecure = true;
+				}
+				else if (!(flags & (SC_EXECUTABLE | SC_SYSTEM)))
+					insecure = true;
 
-		if (insecure) {
-			/* Remove the script */
-			free_checker(checker);
+				if (insecure) {
+					/* Remove the script */
+					free_checker(checker);
+				}
+			}
 		}
 	}
 
@@ -344,9 +338,10 @@ misc_check_child_thread(thread_ref_t thread)
 					/* The process does not exist, and we should
 					 * have reaped its exit status, otherwise it
 					 * would exist as a zombie process. */
-					log_message(LOG_INFO, "Misc script %s child (PID %d) lost", misck_checker->script.args[0], pid);
+					log_message(LOG_INFO, "Misc script %s child (PID %d) lost, register checker again", misck_checker->script.args[0], pid);
 					misck_checker->state = SCRIPT_STATE_IDLE;
 					timeout = 0;
+					goto recheck;
 				} else {
 					log_message(LOG_INFO, "kill -%d of process %s(%d) with new state %u failed with errno %d", sig_num, misck_checker->script.args[0], pid, misck_checker->state, errno);
 					timeout = 1000;
@@ -408,7 +403,8 @@ misc_check_child_thread(thread_ref_t thread)
 				checker->cur_weight = 0;
 				misck_checker->last_exit_code = status;
 			}
-		}
+		} else	//  if (status != misck_checker->last_exit_code)
+			misck_checker->last_exit_code = status;
 	}
 	else if (WIFSIGNALED(wait_status)) {
 		if (misck_checker->state == SCRIPT_STATE_REQUESTING_TERMINATION && WTERMSIG(wait_status) == SIGTERM) {
@@ -495,6 +491,7 @@ misc_check_child_thread(thread_ref_t thread)
 		}
 	}
 
+recheck:
 	/* Register next timer checker */
 	next_time = timer_add_long(misck_checker->last_ran, checker->retry_it ? checker->delay_before_retry : checker->delay_loop);
 	next_time = timer_sub_now(next_time);

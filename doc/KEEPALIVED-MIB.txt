@@ -22,12 +22,28 @@ IMPORTS
         FROM SNMPv2-TC;
 
 keepalived MODULE-IDENTITY
-     LAST-UPDATED "202006120001Z"
+     LAST-UPDATED "202410040001Z"
      ORGANIZATION "Keepalived"
      CONTACT-INFO "http://www.keepalived.org"
      DESCRIPTION
         "This MIB describes objects used by keepalived, both
          for VRRP and health checker."
+     REVISION "202410040001Z"
+     DESCRIPTION "add VrrpSciptIntervalUsec and VrrpScriptTimeoutUsec for higher resolution timers"
+     REVISION "202404050001Z"
+     DESCRIPTION "add missing 64 bit counters for 64 bit stats"
+     REVISION "202403180001Z"
+     DESCRIPTION "add separate path and argv[0] for scripts"
+     REVISION "202212090001Z"
+     DESCRIPTION "add VRRPv3 checksum as VRRPv2"
+     REVISION "202109230001Z"
+     DESCRIPTION "add twos LVS scheduler"
+     REVISION "202109090001Z"
+     DESCRIPTION "correct syntax of vrrpInstanceIndex"
+     REVISION "202109040001Z"
+     DESCRIPTION "add vrrp multicast address"
+     REVISION "202106050001Z"
+     DESCRIPTION "add snmp_name for virtual and real servers"
      REVISION "202006120001Z"
      DESCRIPTION "add script_deleted"
      REVISION "202005070001Z"
@@ -417,6 +433,14 @@ lvsFlushOnStop OBJECT-TYPE
     DESCRIPTION
         "Indicate whether LVS config is flushed at shutdown."
     ::= { global 11 }
+
+v3ChecksumAsV2 OBJECT-TYPE
+    SYNTAX TruthValue
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "True if VRRPv3 IPv4 checksum excludes pseudo-header."
+    ::= { global 12 }
 
 -- ----------------------------------------------------------------------
 -- VRRP part
@@ -918,18 +942,19 @@ VrrpInstanceEntry ::= SEQUENCE {
     vrrpInstanceVrrpVersion INTEGER,
     vrrpInstanceScriptMstrRxLowerPri DisplayString,
     vrrpInstanceScriptDeleted DisplayString,
-    vrrpInstanceNotifyDeleted INTEGER
+    vrrpInstanceNotifyDeleted INTEGER,
+    vrrpInstanceMulticastAddressType InetAddressType,
+    vrrpInstanceMulticastAddress InetAddress,
+    vrrpInstanceV3ChecksumAsV2 INTEGER
 }
 
 vrrpInstanceIndex OBJECT-TYPE
-    SYNTAX INTEGER {
-        static(0)
-    }
+    SYNTAX Integer32 (0..2147483647)
     MAX-ACCESS not-accessible
     STATUS current
     DESCRIPTION
         "Index of the VRRP instance.
-         Instance 0 is for static IP and static routes."
+         Instance 0 is for static IP addresses, routes and rules."
     ::= { vrrpInstanceEntry 1 }
 
 vrrpInstanceName OBJECT-TYPE
@@ -1201,6 +1226,30 @@ vrrpInstanceNotifyDeleted OBJECT-TYPE
     DESCRIPTION
         "Send Deleted rather than Fault notifications if instance is deleted on config reload."
     ::= { vrrpInstanceEntry 33 }
+
+vrrpInstanceMulticastAddressType OBJECT-TYPE
+    SYNTAX InetAddressType
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "A value that represents a type of Internet address."
+    ::= { vrrpInstanceEntry 34 }
+
+vrrpInstanceMulticastAddress OBJECT-TYPE
+    SYNTAX InetAddress
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Multicast address for adverts"
+    ::= { vrrpInstanceEntry 35 }
+
+vrrpInstanceV3ChecksumAsV2 OBJECT-TYPE
+    SYNTAX TruthValue
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "True if VRRPv3 IPv4 checksum excludes pseudo-header."
+    ::= { vrrpInstanceEntry 36 }
 
 vrrpTrackedInterfaceTable OBJECT-TYPE
     SYNTAX SEQUENCE OF VrrpTrackedInterfaceEntry
@@ -2544,7 +2593,10 @@ VrrpScriptEntry ::= SEQUENCE {
     vrrpScriptResult INTEGER,
     vrrpScriptRise Unsigned32,
     vrrpScriptFall Unsigned32,
-    vrrpScriptWgtRev Integer32
+    vrrpScriptWgtRev Integer32,
+    vrrpScriptPath DisplayString,
+    vrrpScriptIntervalUsec Unsigned32,
+    vrrpScriptTimeoutUsec Unsigned32
 }
 
 vrrpScriptIndex OBJECT-TYPE
@@ -2624,6 +2676,32 @@ vrrpScriptWgtRev OBJECT-TYPE
     DESCRIPTION
         "Weight reverse for the script if successful."
     ::= { vrrpScriptEntry 9 }
+
+vrrpScriptPath OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Path to file to be executed when running the script."
+    ::= { vrrpScriptEntry 10 }
+
+vrrpScriptIntervalUsec OBJECT-TYPE
+    SYNTAX Unsigned32
+    UNITS "micro-seconds"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Interval in micro-seconds between two runs of the script."
+    ::= { vrrpScriptEntry 11 }
+
+vrrpScriptTimeoutUsec OBJECT-TYPE
+    SYNTAX Unsigned32
+    UNITS "micro-seconds"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Timeout in micro-seconds for a run of the script."
+    ::= { vrrpScriptEntry 12 }
 
 -- VRRP files
 -- see vrrp_track.h
@@ -3369,7 +3447,15 @@ VirtualServerEntry ::= SEQUENCE {
     virtualServerConnTimeoutUsec Unsigned32,
     virtualServerTunnelType INTEGER,
     virtualServerTunnelPort InetPortNumber,
-    virtualServerTunnelCsum INTEGER
+    virtualServerTunnelCsum INTEGER,
+    virtualServerName DisplayString,
+    virtualServerQuorumUpPath DisplayString,
+    virtualServerQuorumDownPath DisplayString,
+    virtualServerRateCps64 Counter64,
+    virtualServerRateInPPS64 Counter64,
+    virtualServerRateOutPPS64 Counter64,
+    virtualServerRateInBPS64 Counter64,
+    virtualServerRateOutBPS64 Counter64
 }
 
 virtualServerIndex OBJECT-TYPE
@@ -3461,6 +3547,7 @@ virtualServerLoadBalancingAlgo OBJECT-TYPE
     fo(11),
     ovf(12),
     mh(13),
+    twos(14),
     unknown(99)
     }
     MAX-ACCESS read-only
@@ -4002,6 +4089,75 @@ virtualServerTunnelCsum OBJECT-TYPE
         "Default forwarding tunnel checksum type use for this virtual server."
     ::= { virtualServerEntry 70 }
 
+virtualServerName OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Optional SNMP name of this virtual server."
+    ::= { virtualServerEntry 71 }
+
+virtualServerQuorumUpPath OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Path to command to execute when the quorum is met."
+    ::= { virtualServerEntry 72 }
+
+virtualServerQuorumDownPath OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Path to command to execute when the quorum is not met."
+    ::= { virtualServerEntry 73 }
+
+virtualServerRateCps64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "connections/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current connection rate for this virtual server."
+    ::= { virtualServerEntry 74 }
+
+virtualServerRateInPPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "packets/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current in packet rate for this virtual server."
+    ::= { virtualServerEntry 75 }
+
+virtualServerRateOutPPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "packets/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current out packet rate for this virtual server."
+    ::= { virtualServerEntry 76 }
+
+virtualServerRateInBPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "bytes/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current incoming rate for this virtual server."
+    ::= { virtualServerEntry 77 }
+
+virtualServerRateOutBPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "bytes/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current outgoing rate for this virtual server."
+    ::= { virtualServerEntry 78 }
+
 
 -- real servers
 
@@ -4076,7 +4232,15 @@ RealServerEntry ::= SEQUENCE {
     realServerConnTimeoutUsec Unsigned32,
     realServerTunnelType INTEGER,
     realServerTunnelPort InetPortNumber,
-    realServerTunnelCsum INTEGER
+    realServerTunnelCsum INTEGER,
+    realServerName DisplayString,
+    realServerNotifyUpPath DisplayString,
+    realServerNotifyDownPath DisplayString,
+    realServerRateCps64 Counter64,
+    realServerRateInPPS64 Counter64,
+    realServerRateOutPPS64 Counter64,
+    realServerRateInBPS64 Counter64,
+    realServerRateOutBPS64 Counter64
 }
 
 realServerIndex OBJECT-TYPE
@@ -4557,6 +4721,75 @@ realServerTunnelCsum OBJECT-TYPE
         "Forwarding tunnel checksum type use for this real server."
     ::= { realServerEntry 54 }
 
+realServerName OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Optional SNMP name of this real server."
+    ::= { realServerEntry 55 }
+
+realServerNotifyUpPath OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Path to command to execute when this server becomes alive."
+    ::= { realServerEntry 56 }
+
+realServerNotifyDownPath OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Path to command to execute when this server becomes dead."
+    ::= { realServerEntry 57 }
+
+realServerRateCps64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "connections/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current connection rate for this real server."
+    ::= { realServerEntry 58 }
+
+realServerRateInPPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "packets/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current in packet rate for this real server."
+    ::= { realServerEntry 59 }
+
+realServerRateOutPPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "packets/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current out packet rate for this real server."
+    ::= { realServerEntry 60 }
+
+realServerRateInBPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "bytes/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current incoming rate for this real server."
+    ::= { realServerEntry 61 }
+
+realServerRateOutBPS64 OBJECT-TYPE
+    SYNTAX Counter64
+    UNITS "bytes/s"
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION
+        "Current outgoing rate for this real server."
+    ::= { realServerEntry 62 }
+
 lvsSyncDaemon    OBJECT IDENTIFIER ::= { check 6 }
 
 lvsSyncDaemonEnabled OBJECT-TYPE
@@ -4790,7 +5023,8 @@ globalGroup OBJECT-GROUP
     netNamespace,
     dbus,
     dynamicInterfaces,
-    lvsFlushOnStop
+    lvsFlushOnStop,
+    v3ChecksumAsV2
     }
     STATUS current
     DESCRIPTION
@@ -4865,6 +5099,9 @@ vrrpInstanceGroup OBJECT-GROUP
     vrrpInstanceScriptMstrRxLowerPri,
     vrrpInstanceScriptDeleted,
     vrrpInstanceNotifyDeleted,
+    vrrpInstanceMulticastAddressType,
+    vrrpInstanceMulticastAddress,
+    vrrpInstanceV3ChecksumAsV2,
     vrrpTrackedInterfaceName,
     vrrpTrackedInterfaceWeight,
     vrrpTrackedInterfaceWgtRev,
@@ -5009,7 +5246,10 @@ vrrpScriptGroup OBJECT-GROUP
     vrrpScriptResult,
     vrrpScriptRise,
     vrrpScriptFall,
-    vrrpScriptWgtRev
+    vrrpScriptWgtRev,
+    vrrpScriptPath,
+    vrrpScriptIntervalUsec,
+    vrrpScriptTimeoutUsec
     }
     STATUS current
     DESCRIPTION
@@ -5182,7 +5422,15 @@ virtualServerGroup OBJECT-GROUP
     virtualServerConnTimeoutUsec,
     virtualServerTunnelType,
     virtualServerTunnelPort,
-    virtualServerTunnelCsum
+    virtualServerTunnelCsum,
+    virtualServerName,
+    virtualServerQuorumUpPath,
+    virtualServerQuorumDownPath,
+    virtualServerRateCps64,
+    virtualServerRateInPPS64,
+    virtualServerRateOutPPS64,
+    virtualServerRateInBPS64,
+    virtualServerRateOutBPS64
     }
     STATUS current
     DESCRIPTION
@@ -5243,7 +5491,15 @@ realServerGroup OBJECT-GROUP
     realServerConnTimeoutUsec,
     realServerTunnelType,
     realServerTunnelPort,
-    realServerTunnelCsum
+    realServerTunnelCsum,
+    realServerName,
+    realServerNotifyUpPath,
+    realServerNotifyDownPath,
+    realServerRateCps64,
+    realServerRateInPPS64,
+    realServerRateOutPPS64,
+    realServerRateInBPS64,
+    realServerRateOutBPS64
     }
     STATUS current
     DESCRIPTION
