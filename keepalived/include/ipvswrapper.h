@@ -31,6 +31,7 @@
 
 #include "libipvs.h"
 #include "check_data.h"
+#include "sockaddr.h"
 
 #define IPVS_ERROR	0
 #define IPVS_SUCCESS	1
@@ -53,7 +54,7 @@ struct lvs_syncd_config {
 	unsigned			syncid;		/* 0 .. 255, or PARAMETER_UNSET if not configured */
 #ifdef _HAVE_IPVS_SYNCD_ATTRIBUTES_
 	uint16_t			sync_maxlen;
-	struct sockaddr_storage		mcast_group;
+	sockaddr_t			mcast_group;
 	uint16_t			mcast_port;
 	uint8_t				mcast_ttl;
 #endif
@@ -76,9 +77,15 @@ extern void ipvs_syncd_cmd(int, const struct lvs_syncd_config *, int, bool);
 extern void ipvs_syncd_master(const struct lvs_syncd_config *);
 extern void ipvs_syncd_backup(const struct lvs_syncd_config *);
 #endif
+#ifdef _WITH_NFTABLES_
+extern void remove_fwmark_vs(virtual_server_t *, int);
+extern void add_fwmark_vs(virtual_server_t *, int);
+#endif
 
-/* Refresh statistics at most every 5 seconds */
-#define STATS_REFRESH 5
-extern void ipvs_update_stats(virtual_server_t * vs);
+/* Refresh VS statistics at most every global_data->snmp_vs_stats_update_interval */
+extern void ipvs_vs_update_stats(virtual_server_t * vs);
+
+/* Refresh RS statistics at most every global_data->snmp_rs_stats_update_interval */
+extern void ipvs_rs_update_stats(virtual_server_t * vs);
 
 #endif

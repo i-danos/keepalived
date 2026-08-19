@@ -34,12 +34,11 @@
 #include "smtp.h"
 #include "utils.h"
 #include "parser.h"
-#if !HAVE_DECL_SOCK_CLOEXEC
-#include "old_socket.h"
-#endif
 #ifdef THREAD_DUMP
 #include "scheduler.h"
 #endif
+#include "check_parser.h"
+
 
 static void tcp_connect_thread(thread_ref_t);
 
@@ -75,19 +74,22 @@ tcp_check_handler(__attribute__((unused)) const vector_t *strvec)
 static void
 tcp_check_end_handler(void)
 {
-	if (!check_conn_opts(CHECKER_GET_CO())) {
+	if (!check_conn_opts(current_checker->co)) {
 		dequeue_new_checker();
+		return;
 	}
 }
 
 void
 install_tcp_check_keyword(void)
 {
+	vpp_t check_ptr;
+
 	install_keyword("TCP_CHECK", &tcp_check_handler);
-	install_sublevel();
+	check_ptr = install_sublevel(VPP &current_checker);
 	install_checker_common_keywords(true);
-	install_sublevel_end_handler(tcp_check_end_handler);
-	install_sublevel_end();
+	install_level_end_handler(tcp_check_end_handler);
+	install_sublevel_end(check_ptr);
 }
 
 static void
@@ -100,8 +102,8 @@ tcp_epilog(thread_ref_t thread, bool is_success)
 
 	checker = THREAD_ARG(thread);
 
-	if (is_success || checker->retry_it >= checker->retry) {
-		delay = checker->delay_loop;
+	delay = checker->delay_loop;
+	if (is_success || ((checker->is_up || !checker->has_run) && checker->retry_it >= checker->retry)) {
 		checker->retry_it = 0;
 
 		if (is_success && (!checker->is_up || !checker->has_run)) {
@@ -133,7 +135,7 @@ tcp_epilog(thread_ref_t thread, bool is_success)
 				smtp_alert(SMTP_MSG_RS, checker, NULL,
 					   "=> TCP CHECK failed on service <=");
 		}
-	} else {
+	} else if (checker->is_up) {
 		delay = checker->delay_before_retry;
 		++checker->retry_it;
 	}
@@ -150,7 +152,7 @@ tcp_check_thread(thread_ref_t thread)
 	checker_t *checker = THREAD_ARG(thread);
 	int status;
 
-	status = tcp_socket_state(thread, tcp_check_thread);
+	status = tcp_socket_state(thread, tcp_check_thread, 0);
 
 	/* If status = connect_in_progress, next thread is already registered.
 	 * If it is connect_success, the fd is still open.
@@ -205,21 +207,11 @@ tcp_connect_thread(thread_ref_t thread)
 		return;
 	}
 
-#if !HAVE_DECL_SOCK_NONBLOCK
-	if (set_sock_flags(fd, F_SETFL, O_NONBLOCK))
-		log_message(LOG_INFO, "Unable to set NONBLOCK on tcp_connect socket - %s (%d)", strerror(errno), errno);
-#endif
-
-#if !HAVE_DECL_SOCK_CLOEXEC
-	if (set_sock_flags(fd, F_SETFD, FD_CLOEXEC))
-		log_message(LOG_INFO, "Unable to set CLOEXEC on tcp_connect socket - %s (%d)", strerror(errno), errno);
-#endif
-
 	status = tcp_bind_connect(fd, co);
 
 	/* handle tcp connection status & register check worker thread */
 	if(tcp_connection_state(fd, status, thread, tcp_check_thread,
-			co->connection_to)) {
+			co->connection_to, 0)) {
 		close(fd);
 
 		if (status == connect_fail) {

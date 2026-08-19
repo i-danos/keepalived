@@ -50,10 +50,7 @@
 #include "track_process.h"
 #include "global_data.h"
 #include "list_head.h"
-#if !HAVE_DECL_SOCK_NONBLOCK
-#include "old_socket.h"
-#endif
-#include "rbtree.h"
+#include "rbtree_ka.h"
 #include "vrrp_data.h"
 #include "utils.h"
 #include "bitops.h"
@@ -140,17 +137,24 @@ free_process_tree(void)
 {
 	tracked_process_instance_t *tpi, *next;
 
-	rb_for_each_entry_safe(tpi, next, &process_tree, pid_tree) {
+	rbtree_postorder_for_each_entry_safe(tpi, next, &process_tree, pid_tree) {
 		free_ref_tracked_process_list(&tpi->processes);
-		rb_erase(&tpi->pid_tree, &process_tree);
 		FREE(tpi);
 	}
+
+	process_tree = RB_ROOT;
 }
 
 static int
-pid_compare(const tracked_process_instance_t *tpi1, const tracked_process_instance_t *tpi2)
+pid_compare(const void *pid, const rb_node_t *a)
 {
-	return tpi1->pid - tpi2->pid;
+	return less_equal_greater_than(*PTR_CAST_CONST(pid_t, pid), rb_entry_const(a, tracked_process_instance_t, pid_tree)->pid);
+}
+
+static bool
+pid_less(rb_node_t *a, const rb_node_t *b)
+{
+	return rb_entry(a, tracked_process_instance_t, pid_tree)->pid < rb_entry_const(b, tracked_process_instance_t, pid_tree)->pid;
 }
 
 static inline tracked_process_instance_t *
@@ -162,17 +166,23 @@ alloc_tracked_process_instance(pid_t pid)
 	INIT_LIST_HEAD(&new->processes);
 	new->pid = pid;
 	RB_CLEAR_NODE(&new->pid_tree);
-	rb_insert_sort(&process_tree, new, pid_tree, pid_compare);
+	rb_add(&new->pid_tree, &process_tree, pid_less);
 
 	return new;
 }
+
 static inline tracked_process_instance_t *
 add_process(pid_t pid, vrrp_tracked_process_t *tpr, tracked_process_instance_t *tpi)
 {
-	tracked_process_instance_t tp = { .pid = pid };
+	rb_node_t *tpi_node;
 
-	if (!tpi && !(tpi = rb_search(&process_tree, &tp, pid_tree, pid_compare)))
-		tpi = alloc_tracked_process_instance(tp.pid);
+	if (!tpi) {
+		if ((tpi_node = rb_find(&pid, &process_tree, pid_compare)))
+			tpi = rb_entry(tpi_node, tracked_process_instance_t, pid_tree);
+		else
+			tpi = alloc_tracked_process_instance(pid);
+	}
+
 	alloc_ref_tracked_process(tpr, tpi);
 	++tpr->num_cur_proc;
 
@@ -402,15 +412,17 @@ check_process(pid_t pid, char *comm, tracked_process_instance_t *tpi)
 	const char *param_start;
 	vrrp_tracked_process_t *tpr;
 	bool had_process;
-	tracked_process_instance_t tp = { .pid = pid };
+	rb_node_t *tpi_node;
 	bool have_comm = !!comm;
 #ifdef _TRACK_PROCESS_DEBUG_
 	int sav_errno;
 #endif
 
 	/* Are we counting this process now? */
-	if (!tpi)
-		tpi = rb_search(&process_tree, &tp, pid_tree, pid_compare);
+	if (!tpi) {
+		if ((tpi_node = rb_find(&pid, &process_tree, pid_compare)))
+			tpi = rb_entry(tpi_node, tracked_process_instance_t, pid_tree);
+	}
 	had_process = !!tpi;
 
 	/* We want to avoid reading /proc/PID/cmdline, since it reads the process
@@ -572,19 +584,20 @@ process_gained_quorum_timer_thread(thread_ref_t thread)
 static void
 check_process_fork(pid_t parent_pid, pid_t child_pid)
 {
-	tracked_process_instance_t tp = { .pid = parent_pid };
 	tracked_process_instance_t *tpi, *tpi_child;
+	rb_node_t *tpi_node;
 	vrrp_tracked_process_t *tpr;
 	ref_tracked_process_t *rtpr;
 
 	/* If we aren't interested in the parent, we aren't interested in the child */
-	if (!(tpi = rb_search(&process_tree, &tp, pid_tree, pid_compare))) {
+	if (!(tpi_node = rb_find(&parent_pid, &process_tree, pid_compare))) {
 #ifdef _TRACK_PROCESS_DEBUG_
 		if (do_track_process_debug_detail)
 			log_message(LOG_INFO, "Ignoring fork for untracked pid %d", parent_pid);
 #endif
 		return;
 	}
+	tpi = rb_entry(tpi_node, tracked_process_instance_t, pid_tree);
 
 	tpi_child = alloc_tracked_process_instance(child_pid);
 #ifdef _TRACK_PROCESS_DEBUG_
@@ -643,19 +656,20 @@ process_lost_quorum_timer_thread(thread_ref_t thread)
 static void
 check_process_termination(pid_t pid)
 {
-	tracked_process_instance_t tp = { .pid = pid };
 	tracked_process_instance_t *tpi;
+	rb_node_t *tpi_node;
 	vrrp_tracked_process_t *tpr;
 	ref_tracked_process_t *rtpr;
 
-	tpi = rb_search(&process_tree, &tp, pid_tree, pid_compare);
-	if (!tpi) {
+	tpi_node = rb_find(&pid, &process_tree, pid_compare);
+	if (!tpi_node) {
 #ifdef _TRACK_PROCESS_DEBUG_
 		if (do_track_process_debug_detail)
 			log_message(LOG_INFO, "Ignoring exit of untracked pid %d", pid);
 #endif
 		return;
 	}
+	tpi = rb_entry(tpi_node, tracked_process_instance_t, pid_tree);
 
 	list_for_each_entry(rtpr, &tpi->processes, e_list) {
 		tpr = rtpr->process;
@@ -673,7 +687,7 @@ check_process_termination(pid_t pid)
 				tpr->terminate_timer_thread = thread_add_timer(master, process_lost_quorum_timer_thread, tpr, tpr->terminate_delay);
 #ifdef _TRACK_PROCESS_DEBUG_
 				if (do_track_process_debug_detail)
-					log_message(LOG_INFO, "Adding timer %d for %s termination", tpr->fork_delay, tpr->pname);
+					log_message(LOG_INFO, "Adding timer %d for %s termination", tpr->terminate_delay, tpr->pname);
 #endif
 				continue;
 			}
@@ -684,23 +698,24 @@ check_process_termination(pid_t pid)
 	free_tracked_process_instance(tpi);
 }
 
-#if HAVE_DECL_PROC_EVENT_COMM
 static void
 check_process_comm_change(pid_t pid, char *comm)
 {
-	tracked_process_instance_t tp = { .pid = pid };
 	tracked_process_instance_t *tpi;
+	rb_node_t *tpi_node;
 	vrrp_tracked_process_t *tpr;
 	ref_tracked_process_t *rtpr, *rtpr_tmp;
 
-	tpi = rb_search(&process_tree, &tp, pid_tree, pid_compare);
-	if (!tpi) {
+	tpi_node = rb_find(&pid, &process_tree, pid_compare);
+	if (!tpi_node) {
 #ifdef _TRACK_PROCESS_DEBUG_
 		if (do_track_process_debug_detail)
 			log_message(LOG_INFO, "comm_change pid %d not found", pid);
 #endif
+		tpi = NULL;
 		goto end;
 	}
+	tpi = rb_entry(tpi_node, tracked_process_instance_t, pid_tree);
 
 	/* The process was being monitored by its old name */
 	list_for_each_entry_safe(rtpr, rtpr_tmp, &tpi->processes, e_list) {
@@ -738,7 +753,6 @@ check_process_comm_change(pid_t pid, char *comm)
 	/* Handle the new process name */
 	check_process(pid, comm, tpi);
 }
-#endif
 
 /*
  * connect to netlink
@@ -761,16 +775,6 @@ nl_connect(void)
 			log_message(LOG_INFO, "Failed to open process monitoring socket - errno %d - %m", errno);
 		return -1;
 	}
-
-#if !HAVE_DECL_SOCK_NONBLOCK
-	if (set_sock_flags(nl_sd, F_SETFL, O_NONBLOCK))
-		log_message(LOG_INFO, "Unable to set NONBLOCK on netlink process socket - %s (%d)", strerror(errno), errno);
-#endif
-
-#if !HAVE_DECL_SOCK_CLOEXEC
-	if (set_sock_flags(nl_sd, F_SETFD, FD_CLOEXEC))
-		log_message(LOG_INFO, "Unable to set CLOEXEC on netlink process socket - %s (%d)", strerror(errno), errno);
-#endif
 
 	sa_nl.nl_family = AF_NETLINK;
 	sa_nl.nl_groups = CN_IDX_PROC;
@@ -813,7 +817,7 @@ static int set_proc_ev_listen(int nl_sd, bool enable)
 
 	rc = send(nl_sd, &nlcn_msg, sizeof(nlcn_msg), 0);
 	if (rc == -1) {
-		log_message(LOG_INFO, "Failed to set/clear process event listen - errno %d - %m", errno);
+		log_message(LOG_INFO, "Failed to %s process event listen - errno %d - %m", enable ? "set" : "clear", errno);
 		return -1;
 	}
 
@@ -889,8 +893,9 @@ reinitialise_track_processes(void)
 							    , tpr->sav_num_cur_proc
 							    , tpr->num_cur_proc);
 				if (tpr->fork_delay)
-					tpr->fork_timer_thread = thread_add_timer(master, process_gained_quorum_timer_thread, tpr, tpr->terminate_delay);
-				process_update_track_process_status(tpr, true);
+					tpr->fork_timer_thread = thread_add_timer(master, process_gained_quorum_timer_thread, tpr, tpr->fork_delay);
+				else
+					process_update_track_process_status(tpr, true);
 			} else {
 				if (__test_bit(LOG_DETAIL_BIT, &debug))
 					log_message(LOG_INFO, "Process %s, number of current processes changed"
@@ -905,8 +910,6 @@ reinitialise_track_processes(void)
 			}
 		}
 	}
-
-	return;
 }
 
 static void
@@ -1055,14 +1058,11 @@ handle_proc_ev(int nl_sd)
 						proc_ev.event_data.id.r.rgid,
 						proc_ev.event_data.id.e.egid);
 				break;
-#if HAVE_DECL_PROC_EVENT_SID	/* Since Linux v2.6.32 */
 			case PROC_EVENT_SID:
 				log_message(LOG_INFO, "sid change: tid=%d pid=%d",
 						proc_ev.event_data.sid.process_pid,
 						proc_ev.event_data.sid.process_tgid);
 				break;
-#endif
-#if HAVE_DECL_PROC_EVENT_PTRACE	/* Since Linux v3.1 */
 			case PROC_EVENT_PTRACE:
 				log_message(LOG_INFO, "ptrace change: tid=%d pid=%d tracer tid=%d, pid=%d",
 						proc_ev.event_data.ptrace.process_pid,
@@ -1070,22 +1070,17 @@ handle_proc_ev(int nl_sd)
 						proc_ev.event_data.ptrace.tracer_pid,
 						proc_ev.event_data.ptrace.tracer_tgid);
 				break;
-#endif
-#if HAVE_DECL_PROC_EVENT_COMM		/* Since Linux v3.2 */
 			case PROC_EVENT_COMM:
 				log_message(LOG_INFO, "comm: tid=%d pid=%d comm %s",
 						proc_ev.event_data.comm.process_pid,
 						proc_ev.event_data.comm.process_tgid,
 						proc_ev.event_data.comm.comm);
 				break;
-#endif
-#if HAVE_DECL_PROC_EVENT_COREDUMP	/* Since Linux v3.10 */
 			case PROC_EVENT_COREDUMP:
 				log_message(LOG_INFO, "coredump: tid=%d pid=%d",
 						proc_ev.event_data.coredump.process_pid,
 						proc_ev.event_data.coredump.process_tgid);
 				break;
-#endif
 			case PROC_EVENT_EXIT:
 				log_message(LOG_INFO, "exit: tid=%d pid=%d exit_code=%u, signal=%u,",
 						proc_ev.event_data.exit.process_pid,
@@ -1128,9 +1123,6 @@ handle_proc_ev(int nl_sd)
 				log_message(LOG_INFO, "Ignoring exec of thread %d of pid %d", proc_ev.event_data.exec.process_tgid, proc_ev.event_data.exec.process_pid);
 #endif
 			break;
-#if HAVE_DECL_PROC_EVENT_COMM		/* Since Linux v3.2 */
-		/* NOTE: not having PROC_EVENT_COMM means that changes to /proc/PID/comm
-		 * will not be detected */
 		case PROC_EVENT_COMM:
 			if (proc_ev.event_data.comm.process_tgid == proc_ev.event_data.comm.process_pid)
 				check_process_comm_change(proc_ev.event_data.comm.process_tgid, proc_ev.event_data.comm.comm);
@@ -1139,7 +1131,6 @@ handle_proc_ev(int nl_sd)
 				log_message(LOG_INFO, "Ignoring COMM event of thread %d of pid %d", proc_ev.event_data.comm.process_tgid, proc_ev.event_data.comm.process_pid);
 #endif
 			break;
-#endif
 		case PROC_EVENT_EXIT:
 			/* We aren't interested in thread termination */
 			if (proc_ev.event_data.exit.process_tgid == proc_ev.event_data.exit.process_pid)
@@ -1171,7 +1162,7 @@ read_process_update(thread_ref_t thread)
 {
 	handle_proc_ev(thread->u.f.fd);
 
-	read_thread = thread_add_read(thread->master, read_process_update, NULL, thread->u.f.fd, TIMER_NEVER, false);
+	read_thread = thread_add_read(thread->master, read_process_update, NULL, thread->u.f.fd, TIMER_NEVER, 0);
 }
 
 static void
@@ -1184,6 +1175,9 @@ proc_events_ack_timer_thread(__attribute__((unused)) thread_ref_t thread)
 bool
 open_track_processes(void)
 {
+	if (nl_sock != -1)
+		return false;
+
 	nl_sock = nl_connect();
 	if (nl_sock == -1)
 		return true ;
@@ -1244,7 +1238,7 @@ init_track_processes(list_head_t *processes)
 
 	read_procs(processes);
 
-	read_thread = thread_add_read(master, read_process_update, NULL, nl_sock, TIMER_NEVER, false);
+	read_thread = thread_add_read(master, read_process_update, NULL, nl_sock, TIMER_NEVER, 0);
 
 	return rc;
 }
@@ -1259,7 +1253,7 @@ reload_track_processes(void)
 	read_procs(&vrrp_data->vrrp_track_processes);
 
 	/* Add read thread */
-	read_thread = thread_add_read(master, read_process_update, NULL, nl_sock, TIMER_NEVER, false);
+	read_thread = thread_add_read(master, read_process_update, NULL, nl_sock, TIMER_NEVER, 0);
 
 	return;
 }

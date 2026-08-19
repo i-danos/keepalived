@@ -16,7 +16,7 @@ Build-Depends:
  libnfnetlink-dev,
  libnftnl-dev,
  libmnl-dev,
- libsnmp-dev-vyatta,
+ libsnmp-dev,
  pkg-config
 Standards-Version: 4.4.1
 

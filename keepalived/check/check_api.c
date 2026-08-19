@@ -52,27 +52,21 @@
 #include "bfd_daemon.h"
 #endif
 #include "track_file.h"
+#include "check_parser.h"
+
 
 /* Global vars */
-list_head_t checkers_queue;
 #ifdef _CHECKER_DEBUG_
 bool do_checker_debug;
 #endif
+checker_t *current_checker;
 
 /* free checker data */
 void
 free_checker(checker_t *checker)
 {
-	list_del_init(&checker->e_list);
+	list_del_init(&checker->rs_list);
 	(*checker->checker_funcs->free_func) (checker);
-}
-void
-free_checker_list(list_head_t *l)
-{
-	checker_t *checker, *checker_tmp;
-
-	list_for_each_entry_safe(checker, checker_tmp, l, e_list)
-		free_checker(checker);
 }
 
 /* dump checker data */
@@ -104,14 +98,6 @@ dump_checker(FILE *fp, const checker_t *checker)
 
 	(*checker->checker_funcs->dump_func) (fp, checker);
 }
-static void
-dump_checker_list(FILE *fp, const list_head_t *l)
-{
-	checker_t *checker;
-
-	list_for_each_entry(checker, l, e_list)
-		dump_checker(fp, checker);
-}
 
 void
 dump_connection_opts(FILE *fp, const void *data)
@@ -132,30 +118,28 @@ dump_connection_opts(FILE *fp, const void *data)
 		conf_write(fp, "     Last errno = %d", conn->last_errno);
 }
 
-/* Queue a checker into the checkers_queue */
-checker_t *
+/* Queue a checker into the real server's checkers_queue */
+void
 queue_checker(const checker_funcs_t *funcs
 	      , thread_func_t launch
 	      , void *data
 	      , conn_opts_t *co
 	      , bool fd_required)
 {
-	virtual_server_t *vs = list_last_entry(&check_data->vs, virtual_server_t, e_list);
-	real_server_t *rs = list_last_entry(&vs->rs, real_server_t, e_list);
 	checker_t *checker;
 
 	/* Set default dst = RS, timeout = default */
 	if (co) {
-		co->dst = rs->addr;
+		co->dst = current_rs->addr;
 		co->connection_to = UINT_MAX;
 	}
 
 	PMALLOC(checker);
-	INIT_LIST_HEAD(&checker->e_list);
+	INIT_LIST_HEAD(&checker->rs_list);
 	checker->checker_funcs = funcs;
 	checker->launch = launch;
-	checker->vs = vs;
-	checker->rs = rs;
+	checker->vs = current_vs;
+	checker->rs = current_rs;
 	checker->data = data;
 	checker->co = co;
 	checker->enabled = true;
@@ -169,24 +153,24 @@ queue_checker(const checker_funcs_t *funcs
 	checker->default_delay_before_retry = 1 * TIMER_HZ;
 	checker->default_retry = 1 ;
 
-	/* queue the checker */
-	list_add_tail(&checker->e_list, &checkers_queue);
-
 	if (fd_required)
 		check_data->num_checker_fd_required++;
 
-	return checker;
+	list_add_tail(&checker->rs_list, &current_rs->checkers_list);
+
+	current_checker = checker;
 }
 
 void
 dequeue_new_checker(void)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+// TODO - queue checker at end, not at start
+	if (!current_checker->is_up)
+		set_checker_state(current_checker, true);
 
-	if (!checker->is_up)
-		set_checker_state(checker, true);
+	free_checker(current_checker);
 
-	free_checker(checker);
+	current_checker = NULL;
 }
 
 bool
@@ -227,7 +211,7 @@ compare_conn_opts(const conn_opts_t *a, const conn_opts_t *b)
 }
 
 void
-checker_set_dst_port(struct sockaddr_storage *dst, uint16_t port)
+checker_set_dst_port(sockaddr_t *dst, uint16_t port)
 {
 	/* NOTE: we are relying on the offset of sin_port and sin6_port being
 	 * the same if an IPv6 address is specified after the port */
@@ -247,7 +231,7 @@ checker_set_dst_port(struct sockaddr_storage *dst, uint16_t port)
 static void
 co_ip_handler(const vector_t *strvec)
 {
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
 
 	if (inet_stosockaddr(strvec_slot(strvec, 1), NULL, &co->dst))
 		report_config_error(CONFIG_GENERAL_ERROR, "Invalid connect_ip address %s - ignoring", strvec_slot(strvec, 1));
@@ -262,7 +246,7 @@ co_ip_handler(const vector_t *strvec)
 static void
 co_port_handler(const vector_t *strvec)
 {
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
 	unsigned port;
 
 	if (!read_unsigned_strvec(strvec, 1, &port, 1, 65535, true)) {
@@ -277,7 +261,8 @@ co_port_handler(const vector_t *strvec)
 static void
 co_srcip_handler(const vector_t *strvec)
 {
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
+
 	if (inet_stosockaddr(strvec_slot(strvec, 1), NULL, &co->bindto))
 		report_config_error(CONFIG_GENERAL_ERROR, "Invalid bindto address %s - ignoring", strvec_slot(strvec, 1));
 	else if (co->dst.ss_family != AF_UNSPEC &&
@@ -291,7 +276,7 @@ co_srcip_handler(const vector_t *strvec)
 static void
 co_srcport_handler(const vector_t *strvec)
 {
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
 	unsigned port;
 
 	if (!read_unsigned_strvec(strvec, 1, &port, 1, 65535, true)) {
@@ -307,7 +292,7 @@ static void
 co_srcif_handler(const vector_t *strvec)
 {
 	// This is needed for link local IPv6 bindto address
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
 
 	if (strlen(strvec_slot(strvec, 1)) > sizeof(co->bind_if) - 1) {
 		report_config_error(CONFIG_GENERAL_ERROR, "Interface name %s is too long - ignoring", strvec_slot(strvec, 1));
@@ -320,7 +305,7 @@ co_srcif_handler(const vector_t *strvec)
 static void
 co_timeout_handler(const vector_t *strvec)
 {
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
 	unsigned long timer;
 
 	if (!read_timer(strvec, 1, &timer, 1, UINT_MAX, true)) {
@@ -335,7 +320,7 @@ co_timeout_handler(const vector_t *strvec)
 static void
 co_fwmark_handler(const vector_t *strvec)
 {
-	conn_opts_t *co = CHECKER_GET_CO();
+	conn_opts_t *co = current_checker->co;
 	unsigned fwmark;
 
 	if (!read_unsigned_strvec(strvec, 1, &fwmark, 0, UINT_MAX, true)) {
@@ -349,7 +334,7 @@ co_fwmark_handler(const vector_t *strvec)
 static void
 retry_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+	checker_t *checker = current_checker;
 	unsigned retry;
 
 	if (!read_unsigned_strvec(strvec, 1, &retry, 0, UINT_MAX, true)) {
@@ -363,7 +348,7 @@ retry_handler(const vector_t *strvec)
 static void
 delay_before_retry_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+	checker_t *checker = current_checker;
 	unsigned long delay;
 
 	if (!read_timer(strvec, 1, &delay, 0, 0, true)) {
@@ -378,7 +363,7 @@ delay_before_retry_handler(const vector_t *strvec)
 static void
 warmup_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+	checker_t *checker = current_checker;
 	unsigned long warmup;
 
 	if (!read_timer(strvec, 1, &warmup, 0, 0, true)) {
@@ -392,7 +377,7 @@ warmup_handler(const vector_t *strvec)
 static void
 delay_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+	checker_t *checker = current_checker;
 	unsigned long delay_loop;
 
 	if (!read_timer(strvec, 1, &delay_loop, 1, 0, true)) {
@@ -406,7 +391,7 @@ delay_handler(const vector_t *strvec)
 static void
 alpha_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+	checker_t *checker = current_checker;
 	int res = true;
 
 	if (vector_size(strvec) >= 2) {
@@ -421,7 +406,7 @@ alpha_handler(const vector_t *strvec)
 static void
 log_all_failures_handler(const vector_t *strvec)
 {
-	checker_t *checker = CHECKER_GET_CURRENT();
+	checker_t *checker = current_checker;
 	int res = true;
 
 	if (vector_size(strvec) >= 2) {
@@ -455,85 +440,74 @@ install_checker_common_keywords(bool connection_keywords)
 	install_keyword("log_all_failures", &log_all_failures_handler);
 }
 
-/* dump the checkers_queue */
+/* dump the checkers */
 void
-dump_checkers_queue(FILE *fp)
+dump_checkers(FILE *fp)
 {
-	if (!list_empty(&checkers_queue)) {
-		conf_write(fp, "------< Health checkers >------");
-		dump_checker_list(fp, &checkers_queue);
+	virtual_server_t *vs;
+	real_server_t *rs;
+	checker_t *checker;
+	bool dumped_header = false;
+
+	list_for_each_entry(vs, &check_data->vs, e_list) {
+		list_for_each_entry(rs, &vs->rs, e_list) {
+			list_for_each_entry(checker, &rs->checkers_list, rs_list) {
+				if (!dumped_header) {
+					conf_write(fp, "------< Health checkers >------");
+					dumped_header = true;
+				}
+
+				dump_checker(fp, checker);
+			}
+		}
 	}
 }
 
-/* init the global checkers queue */
-void
-init_checkers_queue(void)
-{
-	INIT_LIST_HEAD(&checkers_queue);
-}
-
-/* release the checkers for a virtual server */
-void
-free_vs_checkers(const virtual_server_t *vs)
-{
-	checker_t *checker, *checker_tmp;
-
-	list_for_each_entry_safe(checker, checker_tmp, &checkers_queue, e_list) {
-		if (checker->vs != vs)
-			continue;
-
-		free_checker(checker);
-	}
-}
-
-/* release the checkers for a virtual server */
+/* release the checkers for a real server */
 void
 free_rs_checkers(const real_server_t *rs)
 {
 	checker_t *checker, *checker_tmp;
 
-	list_for_each_entry_safe(checker, checker_tmp, &checkers_queue, e_list) {
-		if (checker->rs != rs)
-			continue;
-
+	list_for_each_entry_safe(checker, checker_tmp, &rs->checkers_list, rs_list)
 		free_checker(checker);
-	}
-}
-
-/* release the checkers_queue */
-void
-free_checkers_queue(void)
-{
-	free_checker_list(&checkers_queue);
 }
 
 /* register checkers to the global I/O scheduler */
 void
 register_checkers_thread(void)
 {
+	virtual_server_t *vs;
+	real_server_t *rs;
 	checker_t *checker;
 	unsigned long warmup;
 
-	list_for_each_entry(checker, &checkers_queue, e_list) {
-		if (checker->launch)
-		{
-			if (checker->vs->ha_suspend && !checker->vs->ha_suspend_addr_count)
-				checker->enabled = false;
+	list_for_each_entry(vs, &check_data->vs, e_list) {
+		list_for_each_entry(rs, &vs->rs, e_list) {
+			list_for_each_entry(checker, &rs->checkers_list, rs_list) {
+				if (checker->launch) {
+					if (checker->vs->ha_suspend && !checker->vs->ha_suspend_addr_count)
+						checker->enabled = false;
 
-			log_message(LOG_INFO, "%sctivating healthchecker for service %s for VS %s"
-					    , checker->enabled ? "A" : "Dea", FMT_RS(checker->rs, checker->vs), FMT_VS(checker->vs));
+					if (!checker->enabled || !checker->has_run)
+						log_message(LOG_INFO, "%sctivating healthchecker for service %s for VS %s"
+								    , checker->enabled ? "A" : "Dea"
+								    , FMT_RS(checker->rs, checker->vs)
+								    , FMT_VS(checker->vs));
 
-			/* wait for a random timeout to begin checker thread.
-			   It helps avoiding multiple simultaneous checks to
-			   the same RS.
-			*/
-			warmup = checker->warmup;
-			if (warmup) {
-				/* coverity[dont_call] */
-				warmup = warmup * (unsigned)random() / RAND_MAX;
+					/* wait for a random timeout to begin checker thread.
+					   It helps avoiding multiple simultaneous checks to
+					   the same RS.
+					*/
+					warmup = checker->warmup;
+					if (warmup) {
+						/* coverity[dont_call] */
+						warmup = warmup * (unsigned)random() / RAND_MAX;
+					}
+					thread_add_timer(master, checker->launch, checker,
+							 BOOTSTRAP_DELAY + warmup);
+				}
 			}
-			thread_add_timer(master, checker->launch, checker,
-					 BOOTSTRAP_DELAY + warmup);
 		}
 	}
 
@@ -555,6 +529,9 @@ addr_matches(const virtual_server_t *vs, void *address)
 	struct in6_addr mask_addr6 = {{{0}}};
 	unsigned addr_base;
 	const void *addr;
+
+	if (vs->vsg)
+		return false;
 
 	if (vs->addr.ss_family != AF_UNSPEC) {
 		if (vs->addr.ss_family == AF_INET6)
@@ -579,10 +556,9 @@ addr_matches(const virtual_server_t *vs, void *address)
 	}
 
 	list_for_each_entry(vsg_entry, &vs->vsg->addr_range, e_list) {
-		struct sockaddr_storage range_addr = vsg_entry->addr;
-		uint32_t ra_base;
+		uint32_t ra_base, ra_end;
 
-		if (!vsg_entry->range) {
+		if (!inet_sockaddrcmp(&vsg_entry->addr, &vsg_entry->addr_end)) {
 			if (vsg_entry->addr.ss_family == AF_INET6)
 				addr = (void *)&PTR_CAST(struct sockaddr_in6, &vsg_entry->addr)->sin6_addr;
 			else
@@ -594,25 +570,29 @@ addr_matches(const virtual_server_t *vs, void *address)
 			continue;
 		}
 
-		if (range_addr.ss_family == AF_INET) {
+		if (vsg_entry->addr.ss_family == AF_INET) {
 			struct in_addr ra;
 
-			ra = PTR_CAST(struct sockaddr_in, &range_addr)->sin_addr;
-			ra_base = ntohl(ra.s_addr) & 0xFF;
+			ra_base = ntohl(PTR_CAST(struct sockaddr_in, &vsg_entry->addr)->sin_addr.s_addr) & 0xFF;
+			ra_end = ntohl(PTR_CAST(struct sockaddr_in, &vsg_entry->addr_end)->sin_addr.s_addr) & 0xFF;
 
-			if (addr_base < ra_base || addr_base > ra_base + vsg_entry->range)
+			if (addr_base < ra_base || addr_base > ra_end)
 				continue;
 
+			ra = PTR_CAST(struct sockaddr_in, &vsg_entry->addr)->sin_addr;
 			ra.s_addr &= htonl(0xFFFFFF00);
 			if (ra.s_addr != mask_addr.s_addr)
 				continue;
 		} else {
-			struct in6_addr ra = PTR_CAST(struct sockaddr_in6, &range_addr)->sin6_addr;
-			ra_base = ntohs(ra.s6_addr16[7]);
+			struct in6_addr ra;
 
-			if (addr_base < ra_base || addr_base > ra_base + vsg_entry->range)
+			ra_base = ntohs(PTR_CAST(struct sockaddr_in6, &vsg_entry->addr)->sin6_addr.s6_addr16[7]);
+			ra_end = ntohs(PTR_CAST(struct sockaddr_in6, &vsg_entry->addr_end)->sin6_addr.s6_addr16[7]);
+
+			if (addr_base < ra_base || addr_base > ra_end)
 				continue;
 
+			ra = PTR_CAST(struct sockaddr_in6, &vsg_entry->addr)->sin6_addr;
 			ra.s6_addr16[7] = 0;
 			if (!inaddr_equal(AF_INET6, &ra, &mask_addr6))
 				continue;
@@ -629,6 +609,7 @@ update_checker_activity(sa_family_t family, void *address, bool enable)
 {
 	checker_t *checker;
 	virtual_server_t *vs;
+	real_server_t *rs;
 	char addr_str[INET6_ADDRSTRLEN];
 	bool address_logged = false;
 
@@ -640,9 +621,6 @@ update_checker_activity(sa_family_t family, void *address, bool enable)
 	}
 
 	if (!using_ha_suspend)
-		return;
-
-	if (list_empty(&checkers_queue))
 		return;
 
 	/* Check if any of the virtual servers are using this address, and have ha_suspend */
@@ -674,16 +652,15 @@ update_checker_activity(sa_family_t family, void *address, bool enable)
 			vs->ha_suspend_addr_count--;
 
 		/* Processing Healthcheckers queue for this vs */
-		list_for_each_entry(checker, &checkers_queue, e_list) {
-			if (checker->vs != vs)
-				continue;
-
-			if (enable != checker->enabled &&
-			    (enable || vs->ha_suspend_addr_count == 0)) {
-				log_message(LOG_INFO, "%sing healthchecker for service %s for VS %s",
-							!checker->enabled ? "Activat" : "Suspend",
-							FMT_RS(checker->rs, checker->vs), FMT_VS(checker->vs));
-				checker->enabled = enable;
+		list_for_each_entry(rs, &vs->rs, e_list) {
+			list_for_each_entry(checker, &rs->checkers_list, rs_list) {
+				if (enable != checker->enabled &&
+				    (enable || vs->ha_suspend_addr_count == 0)) {
+					log_message(LOG_INFO, "%sing healthchecker for service %s for VS %s",
+								!checker->enabled ? "Activat" : "Suspend",
+								FMT_RS(checker->rs, checker->vs), FMT_VS(checker->vs));
+					checker->enabled = enable;
+				}
 			}
 		}
 	}

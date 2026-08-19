@@ -88,11 +88,23 @@ set_mono_offset(struct timespec *ts)
 	clock_gettime(CLOCK_MONOTONIC, &mono_offset);
 	clock_gettime(CLOCK_REALTIME, &realtime_1);
 
-	/* Calculate the mean realtime */
+	/* Calculate the mean realtime. If tv_sec is 4 bytes, then
+	 * adding two times after Sat 10 Jan 13:37:04 GMT 2004 results
+	 * in overflow. If tv_sec is only 6 bytes (unlikely) then
+	 * overflow doesn't occur until the two dates average
+	 * Tue 25 Sep 15:41:04 BST 2231866, */
 	realtime.tv_nsec = (realtime.tv_nsec + realtime_1.tv_nsec) / 2;
-	if ((realtime.tv_sec + realtime_1.tv_sec) & 1)
-		realtime.tv_nsec += NSEC_PER_SEC / 2;
+#ifndef TIME_T_ADD_OVERFLOWS
 	realtime.tv_sec = (realtime.tv_sec + realtime_1.tv_sec) / 2;
+#else
+	realtime.tv_sec = realtime.tv_sec / 2 + realtime_1.tv_sec / 2;
+	if ((realtime.tv_sec & 1) && (realtime_1.tv_sec & 1))
+		realtime.tv_sec++;
+#endif
+
+	/* If the sum would be odd, we need to add * 1/2 second. */
+	if ((realtime.tv_sec ^ realtime_1.tv_sec) & 1)
+		realtime.tv_nsec += NSEC_PER_SEC / 2;
 
 	if (realtime.tv_nsec < mono_offset.tv_nsec) {
 		realtime.tv_nsec += NSEC_PER_SEC;
@@ -184,7 +196,7 @@ set_time_now(void)
 #ifdef _TIMER_CHECK_
 	if (do_timer_check) {
 		unsigned long timediff = (time_now.tv_sec - last_time.tv_sec) * 1000000 + time_now.tv_usec - last_time.tv_usec;
-		log_message(LOG_INFO, "set_time_now called from %s %s:%d, time %ld.%6.6ld difference %lu usec", file, function, line_no, time_now.tv_sec, time_now.tv_usec, timediff);
+		log_message(LOG_INFO, "set_time_now called from %s %s:%d, time %" PRI_tv_sec ".%6.6" PRI_tv_usec " difference %lu usec", file, function, line_no, time_now.tv_sec, time_now.tv_usec, timediff);
 		last_time = time_now;
 	}
 #endif

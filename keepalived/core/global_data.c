@@ -43,6 +43,12 @@
 #endif
 #include "align.h"
 #include "pidfile.h"
+#ifdef _WITH_JSON_
+#include "global_json.h"
+#endif
+#ifdef _WITH_DBUS_
+#include "vrrp_dbus.h"
+#endif
 
 /* global vars */
 data_t *global_data = NULL;
@@ -90,9 +96,9 @@ static void
 set_default_mcast_group(data_t * data)
 {
 	/* coverity[check_return] */
-	inet_stosockaddr(INADDR_VRRP_GROUP, 0, PTR_CAST(struct sockaddr_storage, &data->vrrp_mcast_group4));
+	inet_stosockaddr(INADDR_VRRP_GROUP, NULL, PTR_CAST(sockaddr_t, &data->vrrp_mcast_group4));
 	/* coverity[check_return] */
-	inet_stosockaddr(INADDR6_VRRP_GROUP, 0, PTR_CAST(struct sockaddr_storage, &data->vrrp_mcast_group6));
+	inet_stosockaddr(INADDR6_VRRP_GROUP, NULL, PTR_CAST(sockaddr_t, &data->vrrp_mcast_group6));
 }
 
 static void
@@ -104,6 +110,7 @@ set_vrrp_defaults(data_t * data)
 	data->vrrp_garp_delay = VRRP_GARP_DELAY;
 	data->vrrp_garp_lower_prio_delay = PARAMETER_UNSET;
 	data->vrrp_garp_lower_prio_rep = PARAMETER_UNSET;
+	data->vrrp_down_timer_adverts = VRRP_DOWN_TIMER_ADVERTS;
 #ifdef _HAVE_VRRP_VMAC_
 	data->vrrp_vmac_garp_intvl = 0;
 #endif
@@ -129,7 +136,7 @@ free_email_list(list_head_t *l)
 	email_t *email, *email_tmp;
 
 	list_for_each_entry_safe(email, email_tmp, l, e_list) {
-		FREE(email->addr);
+		FREE_CONST_PTR(email->addr);
 		FREE(email);
 	}
 }
@@ -142,6 +149,69 @@ dump_email_list(FILE *fp, const list_head_t *l)
 		conf_write(fp, "   %s", email->addr);
 }
 
+const char *
+format_email_addr(const char *addr)
+{
+	char *new_addr;
+	size_t len = strlen(addr);
+	const char *end_description;
+	const char *quote_char;
+	unsigned num_esc;
+	const char *ip;
+	char *op;
+
+	if (addr[len - 1] != '>')
+		return STRDUP(addr);
+
+	if (!(end_description = strrchr(addr, '<'))) {
+		/* We don't have a starting < - at the moment log it and copy verbatim */
+		log_message(LOG_INFO, "email address '%s' invalid", addr);
+		return STRDUP(addr);
+	}
+
+	/* Skip over white-space before < */
+	end_description--;
+	while (end_description > addr &&
+	       (*end_description == ' ' ||
+	        *end_description == '\t'))
+	       end_description--;
+
+	/* We can't have a '"' because alloc_strvec_r() doesn't support it.
+	 * We might be able to use alloc_strvec_quoted_escaped(), in which
+	 * case we probably can have embedded '"'s. */
+
+	/* Do we have any of the characters that need quoting - see RFC5322 3.2.3? */
+	quote_char = strpbrk(addr, "()<>[]:;@\\,.");
+	if (!quote_char || quote_char > end_description)
+		return STRDUP(addr);
+
+	/* We need to quote any embedded '"'s or '\'s */
+	quote_char = addr;
+	num_esc = 0;
+	while ((quote_char = strpbrk(quote_char, "\"\\")) &&
+		quote_char <= end_description) {
+		num_esc++;
+		quote_char++;
+	}
+
+	new_addr = MALLOC(len + 2 + num_esc + 1);
+
+	ip = addr;
+	op = new_addr;
+	*op++ = '"';
+	while ((quote_char = strpbrk(ip, "\"\\")) &&
+		quote_char <= end_description) {
+		strncpy(op, ip, quote_char - ip);
+		op += quote_char - ip;
+		*op++ = '\\';
+		*op++ = *quote_char++;
+		ip = quote_char;
+	}
+	sprintf(op, "%.*s\"%s", (int)(end_description - ip + 1), ip, end_description + 1);
+
+	return new_addr;
+}
+
 void
 alloc_email(const char *addr)
 {
@@ -149,7 +219,7 @@ alloc_email(const char *addr)
 
 	PMALLOC(email);
 	INIT_LIST_HEAD(&email->e_list);
-	email->addr = STRDUP(addr);
+	email->addr = format_email_addr(addr);
 
 	list_add_tail(&email->e_list, &global_data->email);
 }
@@ -182,20 +252,14 @@ alloc_global_data(void)
 	new->min_auto_priority_delay = 1000000;	/* 1 second */
 #ifdef _WITH_VRRP_
 	new->vrrp_notify_fifo.fd = -1;
-#if HAVE_DECL_RLIMIT_RTTIME == 1
 	new->vrrp_rlimit_rt = RT_RLIMIT_DEFAULT;
-#endif
 	new->vrrp_rx_bufs_multiples = 3;
 #endif
 #ifdef _WITH_LVS_
 	new->lvs_notify_fifo.fd = -1;
-#if HAVE_DECL_RLIMIT_RTTIME == 1
 	new->checker_rlimit_rt = RT_RLIMIT_DEFAULT;
-#endif
 #ifdef _WITH_BFD_
-#if HAVE_DECL_RLIMIT_RTTIME == 1
 	new->bfd_rlimit_rt = RT_RLIMIT_DEFAULT;
-#endif
 #endif
 #endif
 
@@ -217,6 +281,10 @@ alloc_global_data(void)
 
 	if (snmp_socket)
 		new->snmp_socket = STRDUP(snmp_socket);
+#ifdef _WITH_SNMP_CHECKER_
+	new->snmp_vs_stats_update_interval = 5 * TIMER_HZ;	/* 5 seconds */
+	new->snmp_rs_stats_update_interval = 0;
+#endif
 #endif
 
 #ifdef _WITH_LVS_
@@ -226,6 +294,10 @@ alloc_global_data(void)
 	new->lvs_syncd.mcast_group.ss_family = AF_UNSPEC;
 #endif
 #endif
+#endif
+
+#ifdef _WITH_JSON_
+	new->json_version = JSON_VERSION_V1;
 #endif
 
 	return new;
@@ -245,7 +317,6 @@ init_global_data(data_t * data, data_t *prev_global_data, bool copy_unchangeable
 		prev_global_data->local_name = NULL;
 
 		if (copy_unchangeable_config) {
-#if HAVE_DECL_CLONE_NEWNET
 			FREE_CONST_PTR(data->network_namespace);
 			data->network_namespace = prev_global_data->network_namespace;
 			prev_global_data->network_namespace = NULL;
@@ -253,7 +324,6 @@ init_global_data(data_t * data, data_t *prev_global_data, bool copy_unchangeable
 			FREE_CONST_PTR(data->network_namespace_ipvs);
 			data->network_namespace_ipvs = prev_global_data->network_namespace_ipvs;
 			prev_global_data->network_namespace_ipvs = NULL;
-#endif
 
 			FREE_CONST_PTR(data->instance_name);
 			data->instance_name = prev_global_data->instance_name;
@@ -261,14 +331,16 @@ init_global_data(data_t * data, data_t *prev_global_data, bool copy_unchangeable
 		}
 	}
 
+#ifndef _ONE_PROCESS_DEBUG_
 	if (data->reload_file == DEFAULT_RELOAD_FILE) {
 		if (data->instance_name)
 			data->reload_file = make_pidfile_name(KEEPALIVED_PID_DIR KEEPALIVED_PID_FILE, data->instance_name, RELOAD_EXTENSION);
 		else if (use_pid_dir)
 			data->reload_file = STRDUP(KEEPALIVED_PID_DIR KEEPALIVED_PID_FILE RELOAD_EXTENSION);
 		else
-			data->reload_file = STRDUP(RUN_DIR KEEPALIVED_PID_FILE RELOAD_EXTENSION);
+			data->reload_file = STRDUP(RUNSTATEDIR "/" KEEPALIVED_PID_FILE RELOAD_EXTENSION);
 	}
+#endif
 
 	if (!data->local_name &&
 	    (!data->router_id ||
@@ -298,6 +370,8 @@ init_global_data(data_t * data, data_t *prev_global_data, bool copy_unchangeable
 				data->smtp_helo_name = STRDUP(data->local_name);
 		}
 	}
+
+	set_symlinks(global_data->use_symlinks);
 
 	/* Check that there aren't conflicts with the notify FIFOs */
 #ifdef _WITH_VRRP_
@@ -342,20 +416,33 @@ init_global_data(data_t * data, data_t *prev_global_data, bool copy_unchangeable
 		}
 #endif
 	}
+#ifdef _WITH_SNMP_CHECKER_
+	if (!data->snmp_rs_stats_update_interval)
+		data->snmp_rs_stats_update_interval = data->snmp_vs_stats_update_interval;
+#endif
+#endif
+
+#ifdef _WITH_VRRP_
+#ifdef IPROUTE_USR_DIR
+	if (!data->iproute_usr_dir && IPROUTE_USR_DIR[0])
+		data->iproute_usr_dir = STRDUP(IPROUTE_USR_DIR);
+#endif
+	if (!data->iproute_etc_dir && IPROUTE_ETC_DIR[0])
+		data->iproute_etc_dir = STRDUP(IPROUTE_ETC_DIR);
 #endif
 }
 
 void
-free_global_data(data_t * data)
+free_global_data(data_t **datap)
 {
+	data_t *data = *datap;
+
 	if (!data)
 		return;
 
 	free_email_list(&data->email);
-#if HAVE_DECL_CLONE_NEWNET
 	FREE_CONST_PTR(data->network_namespace);
 	FREE_CONST_PTR(data->network_namespace_ipvs);
-#endif
 	FREE_CONST_PTR(data->instance_name);
 	FREE_CONST_PTR(data->process_name);
 #ifdef _WITH_VRRP_
@@ -397,9 +484,10 @@ free_global_data(data_t * data)
 	FREE_CONST_PTR(data->vrrp_ipset_address);
 	FREE_CONST_PTR(data->vrrp_ipset_address6);
 	FREE_CONST_PTR(data->vrrp_ipset_address_iface6);
-#ifdef HAVE_IPSET_ATTR_IFACE
 	FREE_CONST_PTR(data->vrrp_ipset_igmp);
 	FREE_CONST_PTR(data->vrrp_ipset_mld);
+#ifdef _HAVE_VRRP_VMAC_
+	FREE_CONST_PTR(data->vrrp_ipset_vmac_nd);
 #endif
 #endif
 #endif
@@ -410,9 +498,13 @@ free_global_data(data_t * data)
 #ifdef _WITH_LVS_
 	FREE_CONST_PTR(data->lvs_notify_fifo.name);
 	free_notify_script(&data->lvs_notify_fifo.script);
+#ifdef _WITH_NFTABLES_
+	FREE_CONST_PTR(data->ipvs_nf_table_name);
+#endif
 #endif
 #ifdef _WITH_DBUS_
 	FREE_CONST_PTR(data->dbus_service_name);
+	FREE_CONST_PTR(data->dbus_no_interface_name);
 #endif
 #ifndef _ONE_PROCESS_DEBUG_
 	FREE_CONST_PTR(data->reload_check_config);
@@ -420,7 +512,109 @@ free_global_data(data_t * data)
 	FREE_CONST_PTR(data->reload_time_file);
 #endif
 	FREE_CONST_PTR(data->config_directory);
+#ifdef _WITH_VRRP_
+	FREE_CONST_PTR(data->iproute_usr_dir);
+	FREE_CONST_PTR(data->iproute_etc_dir);
+#endif
+	FREE_CONST_PTR(data->state_dump_file);
+	FREE_CONST_PTR(data->stats_dump_file);
+	FREE_CONST_PTR(data->json_dump_file);
+
 	FREE(data);
+
+	*datap = NULL;
+}
+
+FILE * __attribute__((malloc))
+open_dump_file(const char *default_file_name)
+{
+	FILE *fp;
+	const char *file_name;
+	char *full_file_name;
+	const char *dot;
+	size_t len;
+	const char *dir;
+	size_t dir_len;
+
+	/*
+	 * If no leading /, use tmp_dir
+	 * If trailing /, add "keepalived%s.data", default_file_name
+	 */
+
+	if (global_data->state_dump_file &&
+	    global_data->state_dump_file[0] == '/') {
+		dir = global_data->state_dump_file;
+		dir_len = strlen(dir);
+		if (dir[dir_len - 1] != '/')
+			dir_len = strrchr(dir, '/') - dir;
+	} else {
+		dir = tmp_dir;
+		dir_len = strlen(tmp_dir);
+	}
+
+	if (global_data->state_dump_file &&
+	    global_data->state_dump_file[strlen(global_data->state_dump_file) - 1] != '/') {
+		if (!(file_name = strrchr(global_data->state_dump_file, '/')))
+			file_name = global_data->state_dump_file;
+		else
+			file_name++;	/* Skip to last '/' */
+	} else
+		file_name = "keepalived.data";
+
+	if (!(dot = strrchr(file_name, '.')))
+		dot = file_name + strlen(file_name);
+
+	len = dir_len + 1 + strlen(file_name) + 1 + strlen(default_file_name);
+	if (global_data->data_use_instance) {
+		if (global_data->instance_name)
+			len += strlen(global_data->instance_name) + 1;
+		if (global_data->network_namespace)
+			len += strlen(global_data->network_namespace) + 1;
+	}
+
+	full_file_name = MALLOC(len);
+
+	snprintf(full_file_name, len, "%.*s/%.*s%s%s%s%s%s%s", (int)dir_len, dir,
+			(int)(dot - file_name), file_name,
+			default_file_name,
+			global_data->data_use_instance && (global_data->instance_name || global_data->network_namespace) ? "." : "",
+			global_data->data_use_instance && global_data->network_namespace ? global_data->network_namespace : "",
+			global_data->data_use_instance && global_data->instance_name && global_data->network_namespace ? "_" : "",
+			global_data->data_use_instance && global_data->instance_name ? global_data->instance_name : "",
+			dot);
+
+	fp = fopen_safe(full_file_name, "w");
+
+	if (!fp)
+		log_message(LOG_INFO, "Can't open dump file %s (%d: %s)",
+			full_file_name, errno, strerror(errno));
+
+	FREE_CONST(full_file_name);
+
+	return fp;
+}
+
+static void 
+write_fifo_details(FILE *fp, const notify_fifo_t *fifo, const char *type)
+{
+	conf_write(fp, " %s notify fifo = %s, uid:gid %u:%u", type, fifo->name, fifo->uid, fifo->gid);
+
+	if (!fifo->script)
+		return;
+
+	if (fifo->script->path)
+		conf_write(fp, " %s notify fifo path = %s, script = %s, uid:gid %u:%u",
+			    type,
+			    fifo->script->path,
+			    cmd_str(fifo->script),
+			    fifo->script->uid,
+			    fifo->script->gid);
+	else
+		conf_write(fp, " %s notify fifo script = %s, uid:gid %u:%u",
+			    type,
+			    cmd_str(fifo->script),
+			    fifo->script->uid,
+			    fifo->script->gid);
 }
 
 void
@@ -435,16 +629,21 @@ dump_global_data(FILE *fp, data_t * data)
 	struct tm tm;
 #endif
 	unsigned val;
+	uid_t uid;
+	gid_t gid;
 
 	if (!data)
 		return;
 
 	conf_write(fp, "------< Global definitions >------");
 
-#if HAVE_DECL_CLONE_NEWNET
+#ifndef _ONE_PROCESS_DEBUG_
+	if (config_save_dir)
+		conf_write(fp, " Config save dir = %s", config_save_dir);
+#endif
+
 	conf_write(fp, " Network namespace = %s", data->network_namespace ? data->network_namespace : "(default)");
 	conf_write(fp, " Network namespace ipvs = %s", data->network_namespace_ipvs ? data->network_namespace_ipvs[0] ? data->network_namespace_ipvs : "(default)" : "(main namespace)");
-#endif
 	if (data->instance_name)
 		conf_write(fp, " Instance name = %s", data->instance_name);
 	if (data->process_name)
@@ -461,6 +660,7 @@ dump_global_data(FILE *fp, data_t * data)
 	if (data->bfd_process_name)
 		conf_write(fp, " BFD process name = %s", data->bfd_process_name);
 #endif
+	conf_write(fp, " %s symlinks in script paths", data->use_symlinks ? "Keep" : "Replace");
 	if (data->router_id)
 		conf_write(fp, " Router ID = %s", data->router_id);
 	if (data->smtp_server.ss_family) {
@@ -506,8 +706,11 @@ dump_global_data(FILE *fp, data_t * data)
 	if (data->reload_file)
 		conf_write(fp, " Reload_file = %s", data->reload_file);
 #endif
+	conf_write(fp, " keep script symlinks = %s", data->use_symlinks ? "true" : "false");
 	if (data->config_directory)
 		conf_write(fp, " config save directory = %s", data->config_directory);
+	if (data->data_use_instance)
+		conf_write(fp, " Use instance name in data dumps");
 	if (data->startup_script)
 		conf_write(fp, " Startup script = %s, uid:gid %u:%u, timeout %u",
 			    cmd_str(data->startup_script),
@@ -540,6 +743,7 @@ dump_global_data(FILE *fp, data_t * data)
 #endif
 		conf_write(fp, " Default interface = %s", data->default_ifp ? data->default_ifp->ifname : DFLT_INT);
 	conf_write(fp, " Disable local IGMP = %s", data->disable_local_igmp ? "yes" : "no");
+	conf_write(fp, " Use VRRPv2 checksum for VRRPv3 IPv4 = %s", data->v3_checksum_as_v2 ? "yes" : "no");
 	if (data->lvs_syncd.ifname) {
 		if (data->lvs_syncd.vrrp)
 			conf_write(fp, " LVS syncd vrrp instance = %s"
@@ -567,51 +771,35 @@ dump_global_data(FILE *fp, data_t * data)
 	conf_write(fp, " LVS flush on stop = %s", data->lvs_flush_on_stop == LVS_FLUSH_FULL ? "full" :
 						  data->lvs_flush_on_stop == LVS_FLUSH_VS ? "VS" : "disabled");
 #endif
-	if (data->notify_fifo.name) {
-		conf_write(fp, " Global notify fifo = %s, uid:gid %u:%u", data->notify_fifo.name, data->notify_fifo.uid, data->notify_fifo.gid);
-		if (data->notify_fifo.script)
-			conf_write(fp, " Global notify fifo script = %s, uid:gid %u:%u",
-				    cmd_str(data->notify_fifo.script),
-				    data->notify_fifo.script->uid,
-				    data->notify_fifo.script->gid);
-	}
+	if (data->notify_fifo.name)
+		write_fifo_details(fp, &data->notify_fifo, "Global");
 #ifdef _WITH_VRRP_
-	if (data->vrrp_notify_fifo.name) {
-		conf_write(fp, " VRRP notify fifo = %s, uid:gid %u:%u", data->vrrp_notify_fifo.name, data->vrrp_notify_fifo.uid, data->vrrp_notify_fifo.gid);
-		if (data->vrrp_notify_fifo.script)
-			conf_write(fp, " VRRP notify fifo script = %s, uid:gid %u:%u",
-				    cmd_str(data->vrrp_notify_fifo.script),
-				    data->vrrp_notify_fifo.script->uid,
-				    data->vrrp_notify_fifo.script->gid);
-	}
+	if (data->vrrp_notify_fifo.name)
+		write_fifo_details(fp, &data->vrrp_notify_fifo, "VRRP");
 #endif
 #ifdef _WITH_LVS_
-	if (data->lvs_notify_fifo.name) {
-		conf_write(fp, " LVS notify fifo = %s, uid:gid %u:%u", data->lvs_notify_fifo.name, data->lvs_notify_fifo.uid, data->lvs_notify_fifo.gid);
-		if (data->lvs_notify_fifo.script)
-			conf_write(fp, " LVS notify fifo script = %s, uid:gid %u:%u",
-				    cmd_str(data->lvs_notify_fifo.script),
-				    data->lvs_notify_fifo.script->uid,
-				    data->lvs_notify_fifo.script->gid);
-	}
+	if (data->lvs_notify_fifo.name)
+		write_fifo_details(fp, &data->lvs_notify_fifo, "LVS");
 #endif
 #ifdef _WITH_VRRP_
+	conf_write(fp, " FIFO write vrrp states on reload = %s", data->fifo_write_vrrp_states_on_reload ? "true" : "false");
 	conf_write(fp, " VRRP notify priority changes = %s", data->vrrp_notify_priority_changes ? "true" : "false");
 	if (data->vrrp_mcast_group4.sin_family) {
 		conf_write(fp, " VRRP IPv4 mcast group = %s"
-				    , inet_sockaddrtos(PTR_CAST(struct sockaddr_storage, &data->vrrp_mcast_group4)));
+				    , inet_sockaddrtos(PTR_CAST(sockaddr_t, &data->vrrp_mcast_group4)));
 	}
 	if (data->vrrp_mcast_group6.sin6_family) {
 		conf_write(fp, " VRRP IPv6 mcast group = %s"
-				    , inet_sockaddrtos(PTR_CAST(struct sockaddr_storage, &data->vrrp_mcast_group6)));
+				    , inet_sockaddrtos(PTR_CAST(sockaddr_t, &data->vrrp_mcast_group6)));
 	}
 	conf_write(fp, " Gratuitous ARP delay = %u",
 		       data->vrrp_garp_delay/TIMER_HZ);
 	conf_write(fp, " Gratuitous ARP repeat = %u", data->vrrp_garp_rep);
-	conf_write(fp, " Gratuitous ARP refresh timer = %ld", data->vrrp_garp_refresh.tv_sec);
+	conf_write(fp, " Gratuitous ARP refresh timer = %" PRI_tv_sec, data->vrrp_garp_refresh.tv_sec);
 	conf_write(fp, " Gratuitous ARP refresh repeat = %u", data->vrrp_garp_refresh_rep);
 	conf_write(fp, " Gratuitous ARP lower priority delay = %u", data->vrrp_garp_lower_prio_delay == PARAMETER_UNSET ? PARAMETER_UNSET : data->vrrp_garp_lower_prio_delay / TIMER_HZ);
 	conf_write(fp, " Gratuitous ARP lower priority repeat = %u", data->vrrp_garp_lower_prio_rep);
+	conf_write(fp, " Num adverts before down = %u", data->vrrp_down_timer_adverts);
 #ifdef _HAVE_VRRP_VMAC_
 	if (data->vrrp_vmac_garp_intvl != PARAMETER_UNSET)
 		conf_write(fp, " Gratuitous ARP for each secondary %s = %us", data->vrrp_vmac_garp_all_if ? "i/f" : "VMAC", data->vrrp_vmac_garp_intvl);
@@ -635,25 +823,37 @@ dump_global_data(FILE *fp, data_t * data)
 				conf_write(fp," ipset IPv6 address set = %s", data->vrrp_ipset_address6);
 			if (data->vrrp_ipset_address_iface6)
 				conf_write(fp," ipset IPv6 address,iface set = %s", data->vrrp_ipset_address_iface6);
-#ifdef HAVE_IPSET_ATTR_IFACE
 			if (data->vrrp_ipset_igmp)
 				conf_write(fp," ipset IGMP set = %s", data->vrrp_ipset_igmp);
 			if (data->vrrp_ipset_mld)
 				conf_write(fp," ipset MLD set = %s", data->vrrp_ipset_mld);
+#ifdef _HAVE_VRRP_VMAC_
+			if (data->vrrp_ipset_vmac_nd)
+				conf_write(fp," ipset ND set = %s", data->vrrp_ipset_vmac_nd);
 #endif
 		}
 #endif
 	}
 #endif
 #ifdef _WITH_NFTABLES_
+#ifdef _WITH_VRRP_
 	if (data->vrrp_nf_table_name) {
 		conf_write(fp," nftables table name = %s", data->vrrp_nf_table_name);
 		conf_write(fp," nftables base chain priority = %d", data->vrrp_nf_chain_priority);
-		conf_write(fp," nftables with%s counters", data->vrrp_nf_counters ? "" : "out");
 		conf_write(fp," nftables %sforce use ifindex for link local IPv6", data->vrrp_nf_ifindex ? "" : "don't ");
-		conf_write(fp," libnftnl version %u.%u.%u", LIBNFTNL_VERSION >> 16,
-			       (LIBNFTNL_VERSION >> 8) & 0xff, LIBNFTNL_VERSION & 0xff);
 	}
+#endif
+
+#ifdef _WITH_LVS_
+	if (data->ipvs_nf_table_name) {
+		conf_write(fp," ipvs nftables table name = %s", data->ipvs_nf_table_name);
+		conf_write(fp," ipvs nftables base chain priority = %d", data->ipvs_nf_chain_priority);
+		conf_write(fp," ipvs nftables start fwmark = %u", data->ipvs_nftables_start_fwmark);
+	}
+#endif
+	conf_write(fp," nftables with%s counters", data->nf_counters ? "" : "out");
+	conf_write(fp," libnftnl version %u.%u.%u", LIBNFTNL_VERSION >> 16,
+		       (LIBNFTNL_VERSION >> 8) & 0xff, LIBNFTNL_VERSION & 0xff);
 #endif
 
 	conf_write(fp, " VRRP check unicast_src = %s", data->vrrp_check_unicast_src ? "true" : "false");
@@ -663,7 +863,7 @@ dump_global_data(FILE *fp, data_t * data)
 		conf_write(fp, " Max auto priority = Disabled");
 	else
 		conf_write(fp, " Max auto priority = %d", data->max_auto_priority);
-	conf_write(fp, " Min auto priority delay = %ld usecs", data->min_auto_priority_delay);
+	conf_write(fp, " Min auto priority delay = %u usecs", data->min_auto_priority_delay);
 	conf_write(fp, " VRRP process priority = %d", data->vrrp_process_priority);
 	conf_write(fp, " VRRP don't swap = %s", data->vrrp_no_swap ? "true" : "false");
 	conf_write(fp, " VRRP realtime priority = %u", data->vrrp_realtime_priority);
@@ -671,9 +871,7 @@ dump_global_data(FILE *fp, data_t * data)
 		get_process_cpu_affinity_string(&data->vrrp_cpu_mask, cpu_str, 63);
 		conf_write(fp, " VRRP CPU Affinity = %s", cpu_str);
 	}
-#if HAVE_DECL_RLIMIT_RTTIME
 	conf_write(fp, " VRRP realtime limit = %" PRI_rlim_t, data->vrrp_rlimit_rt);
-#endif
 #endif
 #ifdef _WITH_LVS_
 	conf_write(fp, " Checker process priority = %d", data->checker_process_priority);
@@ -683,9 +881,7 @@ dump_global_data(FILE *fp, data_t * data)
 		get_process_cpu_affinity_string(&data->checker_cpu_mask, cpu_str, 63);
 		conf_write(fp, " Checker CPU Affinity = %s", cpu_str);
 	}
-#if HAVE_DECL_RLIMIT_RTTIME
 	conf_write(fp, " Checker realtime limit = %" PRI_rlim_t, data->checker_rlimit_rt);
-#endif
 #endif
 #ifdef _WITH_BFD_
 	conf_write(fp, " BFD process priority = %d", data->bfd_process_priority);
@@ -695,9 +891,7 @@ dump_global_data(FILE *fp, data_t * data)
 		get_process_cpu_affinity_string(&data->bfd_cpu_mask, cpu_str, 63);
 		conf_write(fp, " BFD CPU Affinity = %s", cpu_str);
 	}
-#if HAVE_DECL_RLIMIT_RTTIME
 	conf_write(fp, " BFD realtime limit = %" PRI_rlim_t, data->bfd_rlimit_rt);
-#endif
 #endif
 #ifdef _WITH_SNMP_VRRP_
 	conf_write(fp, " SNMP vrrp %s", data->enable_snmp_vrrp ? "enabled" : "disabled");
@@ -715,18 +909,24 @@ dump_global_data(FILE *fp, data_t * data)
 	conf_write(fp, " SNMP traps %s", data->enable_traps ? "enabled" : "disabled");
 	conf_write(fp, " SNMP socket = %s", data->snmp_socket ? data->snmp_socket : "default (unix:/var/agentx/master)");
 #endif
+#ifdef _WITH_SNMP_CHECKER_
+	conf_write(fp, " SNMP VS stats update interval = %s", format_decimal(data->snmp_vs_stats_update_interval, TIMER_HZ_DIGITS));
+	conf_write(fp, " SNMP RS stats update interval = %s", format_decimal(data->snmp_rs_stats_update_interval, TIMER_HZ_DIGITS));
+#endif
 #ifdef _WITH_DBUS_
 	conf_write(fp, " DBus %s", data->enable_dbus ? "enabled" : "disabled");
 	conf_write(fp, " DBus service name = %s", data->dbus_service_name ? data->dbus_service_name : "");
+	conf_write(fp, " DBus no interface name = %s", data->dbus_no_interface_name ? data->dbus_no_interface_name : dbus_no_interface_name);
 #endif
 	conf_write(fp, " Script security %s", script_security ? "enabled" : "disabled");
-	conf_write(fp, " Default script uid:gid %u:%u", default_script_uid, default_script_gid);
+	if (!get_default_script_user(&uid, &gid))
+		conf_write(fp, " Default script uid:gid %u:%u", uid, gid);
 #ifdef _WITH_VRRP_
 	conf_write(fp, " vrrp_netlink_cmd_rcv_bufs = %u", global_data->vrrp_netlink_cmd_rcv_bufs);
 	conf_write(fp, " vrrp_netlink_cmd_rcv_bufs_force = %d", global_data->vrrp_netlink_cmd_rcv_bufs_force);
 	conf_write(fp, " vrrp_netlink_monitor_rcv_bufs = %u", global_data->vrrp_netlink_monitor_rcv_bufs);
 	conf_write(fp, " vrrp_netlink_monitor_rcv_bufs_force = %d", global_data->vrrp_netlink_monitor_rcv_bufs_force);
-#ifdef _WITH_CN_PROC_
+#ifdef _WITH_TRACK_PROCESS_
 	conf_write(fp, " process_monitor_rcv_bufs = %u", global_data->process_monitor_rcv_bufs);
 	conf_write(fp, " process_monitor_rcv_bufs_force = %d", global_data->process_monitor_rcv_bufs_force);
 #endif
@@ -755,6 +955,8 @@ dump_global_data(FILE *fp, data_t * data)
 		conf_write(fp, " vrrp_startup_delay = %g", global_data->vrrp_startup_delay / TIMER_HZ_DOUBLE);
 	if (global_data->log_unknown_vrids)
 		conf_write(fp, " log_unknown_vrids");
+	if (global_data->vrrp_owner_ignore_adverts)
+		conf_write(fp, " vrrp_owner_ignore_adverts");
 #ifdef _HAVE_VRRP_VMAC_
 	if (global_data->vmac_prefix)
 		conf_write(fp, " VMAC prefix = %s", global_data->vmac_prefix);
@@ -764,8 +966,19 @@ dump_global_data(FILE *fp, data_t * data)
 #endif
 	if ((val = get_cur_priority()))
 		conf_write(fp, " current realtime priority = %u", val);
-#if HAVE_DECL_RLIMIT_RTTIME
 	if ((val = get_cur_rlimit_rttime()))
 		conf_write(fp, " current realtime time limit = %u", val);
+#ifdef _WITH_JSON_
+	conf_write(fp, " json_version %u", global_data->json_version);
 #endif
+#ifdef _WITH_VRRP_
+	conf_write(fp, " iproute usr directory %s", global_data->iproute_usr_dir ? global_data->iproute_usr_dir : "(none)");
+	conf_write(fp, " iproute etc directory %s", global_data->iproute_etc_dir ? global_data->iproute_etc_dir : "(none)");
+#endif
+	if (global_data->state_dump_file)
+		conf_write(fp, " state dump file %s", global_data->state_dump_file);
+	if (global_data->stats_dump_file)
+		conf_write(fp, " stats dump file %s", global_data->stats_dump_file);
+	if (global_data->json_dump_file)
+		conf_write(fp, " json dump file %s", global_data->json_dump_file);
 }

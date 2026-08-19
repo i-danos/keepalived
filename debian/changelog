@@ -1,3 +1,56 @@
+keepalived (1:2.3.3-1vyatta1) unstable; urgency=medium
+
+  * Rebase the DANOS patches onto Debian 13's keepalived 2.3.3.
+    Epoch 1: matches Debian's 1:2.3.3-1 so apt prefers this build.
+
+  * Reorganise the series by function, 19 patches down to 5. The old split
+    dated from 2.2.0 and no longer holds: keepalived_netlink.c was touched by
+    seven patches and vrrp.c by six, so on 2.3.3 the boundaries could only be
+    kept by splitting shared files hunk by hunk. The new grouping gives each
+    patch its own files, so any one of them can be read or reverted alone.
+    Each patch carries a header explaining what it covers.
+
+  * Drop three patches outright:
+    - vyatta_track_pathmon_feature: its own header states the path-monitor
+      feature is closed source. No such daemon exists in the open tree, so
+      the tracked object can never appear.
+    - vyatta_track_route_feature: expressed with keepalived's native
+      track_script instead (a script running "ip route get").
+    - v2_2_20_fixup: upstream already carries the default-policy half; the
+      root-policy send_type split only narrows a blanket allow that is its
+      superset, and dropping syslog.target is cosmetic.
+
+  * Drop changes upstream has since made on its own:
+    - "Virtual IP :" already prints the count as "Virtual IP (%u):".
+    - num_script_if_fault gave way to the flags_if_fault bitmask, where
+      VRRP_ISUP() is !flags_if_fault. Clamping a counter is meaningless when
+      clearing a flag is idempotent.
+    - set_sock_flags() is gone; SOCK_CLOEXEC is now unconditional.
+
+  * Fix a defect carried in the DBus patch: it passed an interface_t* where a
+    const char* was expected, working only because interface_t begins with
+    char ifname[]. The same patch already used the type-correct
+    IF_NAME(IF_BASE_IFP(...)) elsewhere, so this was a slip; GCC 14 rejects it.
+
+  * Follow the API drift from 2.2.0 to 2.3.3: vmac_flags folded into flags,
+    nopreempt into the VRRP_FLAG_NOPREEMPT bit, struct sockaddr_storage into
+    sockaddr_t, the parser's vrrp into current_vrrp, scheduler callbacks from
+    int(thread_t *) to void(thread_ref_t), and vrrp_sync_backup gaining a
+    resign argument, for which VRRP_TSM entries get a thin wrapper.
+
+  * Verified on two nodes sharing an L2 segment, against the behaviour
+    recorded from 2.2.0-vyatta4: election (higher priority takes MASTER,
+    interoperating with a 2.2.0 peer), VIP reachable on the master's MAC,
+    failover on master loss, and VIP MAC migration to the backup.
+
+    That testing caught a real bug the compiler could not: the receive path
+    still read the IP header from the start of the buffer, which under
+    PF_PACKET holds the Ethernet header, so TTL came back as 41 and every
+    peer advert was rejected as "invalid TTL/HL". The header is now read from
+    the Ethernet payload, and adverts are parsed and compared correctly.
+
+ -- DANOS Package Maintainers <DANOS@att.com>  Tue, 18 Aug 2026 08:00:00 +0000
+
 keepalived (2.2.0-vyatta4) unstable; urgency=medium
 
   * Bugfix/correct fault count for intf creation

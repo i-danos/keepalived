@@ -15,7 +15,7 @@ keepalived \- load\-balancing and high\-availability service
 [\fB\-\-all\fP]
 [\fB\-l\fP|\fB\-\-log\-console\fP]
 [\fB\-D\fP|\fB\-\-log\-detail\fP]
-[\fB\-S\fP|\fB\-\-log\-facility\fP={0-7}]
+[\fB\-S\fP|\fB\-\-log\-facility\fP={0\-7|local{0\-7}|user|daemon}]
 [\fB\-g\fP|\fB\-\-log\-file\fP=FILE]
 [\fB\-\-flush\-log\-file\fP]
 [\fB\-G\fP|\fB\-\-no\-syslog\fP]
@@ -27,6 +27,7 @@ keepalived \- load\-balancing and high\-availability service
 [\fB\-d\fP|\fB\-\-dump\-conf\fP]
 [\fB\-p\fP|\fB\-\-pid\fP=FILE]
 [\fB\-r\fP|\fB\-\-vrrp_pid\fP=FILE]
+[\fB\-T\fP|\fB\-\-genhash\fP]
 [\fB\-c\fP|\fB\-\-checkers_pid\fP=FILE]
 [\fB\-a\fP|\fB\-\-address-monitoring\fP]
 [\fB\-b\fP|\fB\-\-bfd_pid\fP=FILE]
@@ -43,6 +44,7 @@ keepalived \- load\-balancing and high\-availability service
 [\fB\-\-perf\fP[={all|run|end}]]
 [\fB\-\-debug\fP[=debug-options]]
 [\fB\-\-no-mem-check\fP]
+[\fB\-\-ignore-sigint\fP]
 [\fB\-v\fP|\fB\-\-version\fP]
 [\fB\-h\fP|\fB\-\-help\fP]
 
@@ -61,6 +63,7 @@ with director failover.
 \fB -f, --use-file\fP=FILE
 Use the specified configuration file. The default configuration file
 is "@DEFAULT_CONFIG_FILE@".
+Deprecated alternative is "@OLD_DEFAULT_CONFIG_FILE@".
 .TP
 \fB -P, --vrrp\fP
 Only run the VRRP subsystem. This is useful for configurations that do
@@ -83,8 +86,9 @@ messages to syslog.
 \fB -D, --log-detail\fP
 Detailed log messages.
 .TP
-\fB -S, --log-facility\fP=[0-7]
-Set syslog facility to LOG_LOCAL[0-7]. The default syslog facility is LOG_DAEMON.
+\fB \-S, \-\-log\-facility\fP={0\-7|local{0\-7}|user|daemon}
+Set syslog facility to LOG_LOCAL[0\-7], LOG_USER or LOG_DAEMON.
+The default syslog facility is LOG_DAEMON.
 .TP
 \fB -g, --log-file\fP=FILE
 Write log entries to FILE. FILE will have _vrrp, _healthcheckers, and _bfd
@@ -132,6 +136,12 @@ below for more details.
 Use the specified pidfile for the VRRP child process. The default pidfile
 for the VRRP child process is "@RUN_DIR_ROOT@/run/keepalived_vrrp.pid", unless a
 network namespace is being used.
+.TP
+\fB -T, --genhash\fP
+Enter genhash utility mode. Previous versions of keepalived were shipped with a
+dedicated genhash utility. genhash is now part of the mainline code. We keep
+compatibility with previous genhash utility command line option. For more
+information please refer to the genhash(1) manpage.
 .TP
 \fB -c, --checkers_pid\fP=FILE
 Use the specified pidfile for checkers child process. The default pidfile
@@ -206,6 +216,10 @@ The data recorded is for use with the perf tool.
 .TP
 \fB --no-mem-check\fP
 Disable malloc() etc mem-checks if they have been compiled into keepalived.
+.TP
+\fB --ignore-sigint\fP
+Disable SIGINT handling (defaults to terminating keepalived). This is needed
+for running keepalived under GDB.
 .TP
 \fB --debug\fP[=debug-options]]
 Enables debug options if they have been compiled into keepalived.
@@ -337,6 +351,24 @@ This causes
 .B keepalived
 to close down all interfaces, reload its configuration, and
 start up with the new configuration.
+.IP
+.B Note:
+If a virtual_ipaddress, virtual_route or virtual_rule is being moved from
+one VRRP instance to another one, two reloads will be necessary, the first
+to remove the virtual ipaddress/route/rule, and the second reload to add it
+to the VRRP instance it is now to be configured on. Failing to do this can
+result in the ipaddress/route/rule not being configured on the new instance
+if both the old and new instances are in master state.
+It will usually work with a single reload, however, if either of the VRRP
+instances is not in MASTER state or if the VRRP instance the
+ipaddress/route/rule the VRRP instance is being
+.B added to
+is later in the original configuration file than the instance it is being
+removed from.
+.B Note2:
+If a configuration is running with SNMP enable, and then a reload is done
+with a configuration that does not enable SNMP, it is not possible to
+subsequently re-enable SNMP. The reason for this is not currently understood.
 .TP
 .B TERM\fP, \fBINT\fP or \fBSIGFUNC=STOP
 .B keepalived
@@ -344,20 +376,20 @@ will shut down.
 .TP
 .B USR1\fP or \fBSIGFUNC=DATA
 Write configuration data to
-.B @KA_TMP_DIR@/keepalived.data
+.B @KA_TMP_DIR@/keepalived.data or file configured by state_dump_file
 .TP
 .B USR2\fP or \fBSIGFUNC=STATS
 Write statistics info to
-.B @KA_TMP_DIR@/keepalived.stats
+.B @KA_TMP_DIR@/keepalived.stats or file configured by stats_dump_file
 .TP
 .B SIGFUNC=STATS_CLEAR
 Write statistics info to
-.B @KA_TMP_DIR@/keepalived.stats
+.B @KA_TMP_DIR@/keepalived.stats or file configured by stats_dump_file
 and clear the statistics counters
 .TP
 .B SIGFUNC=JSON
 Write configuration data in JSON format to
-.B @KA_TMP_DIR@/keepalived.json
+.B @KA_TMP_DIR@/keepalived.json or file configured  by json_dump_file
 .TP
 .B SIGFUNC=TDATA
 This causes

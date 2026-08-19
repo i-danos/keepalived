@@ -1,0 +1,100 @@
+Keep a snapshot of the box's own addresses
+
+Reading VRRP with a packet socket (see vyatta-vrrp-core) means we also see
+the adverts we sent ourselves. Deciding whether an advert is our own needs
+the set of local addresses, so keep a getifaddrs() snapshot in global_data
+and refresh it whenever netlink reports an address change.
+
+Index: b/keepalived/core/global_data.c
+===================================================================
+--- a/keepalived/core/global_data.c
++++ b/keepalived/core/global_data.c
+@@ -235,6 +235,15 @@ alloc_global_data(void)
+ 
+ 	PMALLOC(new);
+ 	INIT_LIST_HEAD(&new->email);
++	new->local_addresses = NULL;
++
++	if (getifaddrs(&(new->local_addresses)) == -1) {
++		log_message(LOG_ERR, "Failed to allocate getifaddrs, %d", errno);
++		free_email_list(&new->email);
++		FREE(new);
++		return NULL;
++	}
++
+ 	new->smtp_alert = -1;
+ #ifdef _WITH_VRRP_
+ 	new->smtp_alert_vrrp = -1;
+@@ -440,6 +449,10 @@ free_global_data(data_t **datap)
+ 	if (!data)
+ 		return;
+ 
++	if (data->local_addresses != NULL) {
++		freeifaddrs(data->local_addresses);
++		data->local_addresses = NULL;
++	}
+ 	free_email_list(&data->email);
+ 	FREE_CONST_PTR(data->network_namespace);
+ 	FREE_CONST_PTR(data->network_namespace_ipvs);
+Index: b/keepalived/include/global_data.h
+===================================================================
+--- a/keepalived/include/global_data.h
++++ b/keepalived/include/global_data.h
+@@ -30,6 +30,7 @@
+ #include <stdio.h>
+ #include <sys/socket.h>
+ #include <sched.h>
++#include <ifaddrs.h>
+ #include <linux/netfilter/x_tables.h>
+ 
+ #ifdef _HAVE_LIBIPSET_
+@@ -91,6 +92,7 @@ typedef enum {
+ 
+ /* Configuration data root */
+ typedef struct _data {
++	struct ifaddrs		*local_addresses;	/* Snapshot of local addrs, refreshed on netlink addr events */
+ 	const char			*process_name;
+ #ifdef _WITH_VRRP_
+ 	const char			*vrrp_process_name;
+Index: b/keepalived/include/keepalived_netlink.h
+===================================================================
+--- a/keepalived/include/keepalived_netlink.h
++++ b/keepalived/include/keepalived_netlink.h
+@@ -129,6 +129,7 @@ extern struct rtattr *rta_nest(struct rt
+ extern size_t rta_nest_end(struct rtattr *, struct rtattr *);
+ extern ssize_t netlink_talk(nl_handle_t *, struct nlmsghdr *);
+ extern int netlink_interface_lookup(char *);
++extern int netlink_address_lookup(void);
+ extern void kernel_netlink_poll(void);
+ extern void process_if_status_change(interface_t *);
+ #endif
+Index: b/keepalived/vrrp/vrrp_daemon.c
+===================================================================
+--- a/keepalived/vrrp/vrrp_daemon.c
++++ b/keepalived/vrrp/vrrp_daemon.c
+@@ -517,6 +517,11 @@ start_vrrp(data_t *prev_global_data)
+ 
+ 	if (!global_data)
+ 		global_data = alloc_global_data();
++	if (global_data == NULL) {
++		stop_vrrp(KEEPALIVED_EXIT_FATAL);
++		return;
++	}
++	netlink_address_lookup();
+ 
+ 	/* Parse configuration file */
+ 	vrrp_data = alloc_vrrp_data();
+@@ -832,6 +837,13 @@ reload_vrrp_thread(__attribute__((unused
+ 
+ 	reinitialise_global_vars();
+ 
++	if (!list_empty(&vrrp_data->vrrp)) {
++		vrrp_t *vrrp;
++		list_for_each_entry(vrrp, &vrrp_data->vrrp, e_list) {
++			clear_address_list(&vrrp->vip, true);
++		}
++	}
++
+ 	/* set the reloading flag */
+ 	SET_RELOAD;
+ 

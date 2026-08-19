@@ -31,9 +31,6 @@
 #if HAVE_DECL_RTA_ENCAP && HAVE_DECL_LWTUNNEL_ENCAP_MPLS
 #include <linux/mpls.h>
 #endif
-#ifdef RTNETLINK_H_NEEDS_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
 #include <linux/rtnetlink.h>
 
 /* local includes */
@@ -157,6 +154,8 @@ enum ip_route {
 	IPROUTE_PREF,
 	IPROUTE_FASTOPEN_NO_COOKIE,
 	IPROUTE_TTL_PROPAGATE,
+	IPROUTE_ADD_ROUTE,
+	IPROUTE_APPEND_ROUTE
 };
 
 #define	IPROUTE_BIT_DSFIELD	(1<<IPROUTE_DSFIELD)
@@ -182,6 +181,8 @@ enum ip_route {
 #define	IPROUTE_BIT_PREF	(1<<IPROUTE_PREF)
 #define	IPROUTE_BIT_FASTOPEN_NO_COOKIE	(1<<IPROUTE_FASTOPEN_NO_COOKIE)
 #define	IPROUTE_BIT_TTL_PROPAGATE (1<<IPROUTE_TTL_PROPAGATE)
+#define	IPROUTE_BIT_ADD		(1<<IPROUTE_ADD_ROUTE)
+#define	IPROUTE_BIT_APPEND	(1<<IPROUTE_APPEND_ROUTE)
 
 typedef struct _ip_route {
 	ip_address_t		*dst;

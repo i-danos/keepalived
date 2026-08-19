@@ -61,7 +61,7 @@
 #include "bitops.h"
 #include "utils.h"
 #include "process.h"
-
+#include "signals.h"
 
 #ifdef USE_MEMFD_CREATE_SYSCALL
 #ifndef SYS_memfd_create
@@ -79,7 +79,7 @@
  * overridden by the global_defs tmp_config_directory option.
  *
  * The temporary file contains all the lines of the original configuration file(s)
- * stripped of leading and training whitespace and comments, with the following
+ * stripped of leading and trailing whitespace and comments, with the following
  * exceptions:
  * 1. include statements are passed as blank lines.
  * 2. When an included file is opened, a line starting "# " followed by the file
@@ -113,8 +113,6 @@ typedef enum _include {
 	INCLUDE_B = 0x08,	/* All glob brace specifiers must match */
 } include_t;
 
-/* Some development/test options */
-// #define TRUNCATE_FILE_AFTER_READ
 
 typedef struct _defs {
 	const char *name;
@@ -198,20 +196,26 @@ bool do_parser_debug;
 #ifdef _DUMP_KEYWORDS_
 bool do_dump_keywords;
 #endif
+#ifndef _ONE_PROCESS_DEBUG_
+const char *config_save_dir;
+#endif
 
 /* Error handling variables */
 static unsigned include_check;
 
 /* The following 3 variables should be static, but that causes an optimiser bug in GCC */
+#if HAVE_DECL_GLOB_ALTDIRFUNC
 unsigned missing_directories;
 unsigned missing_files;
 bool have_wildcards;
+#endif
 static bool config_file_error;
 
 /* local vars */
 static vector_t *current_keywords;
 static int sublevel = 0;
 static int skip_sublevel = 0;
+static vpp_t cur_check_ptr;
 static LIST_HEAD_INITIALIZE(multiline_stack); /* multiline_stack_ent */
 static size_t multiline_seq_depth = 0;
 static char *buf_extern;
@@ -536,124 +540,33 @@ read_unsigned64_func(const char *number, int base, uint64_t *res, uint64_t min_v
 #endif
 }
 
-static bool
-read_double_func(const char *number, double *res, double min_val, double max_val, __attribute__((unused)) bool ignore_error)
-{
-	double val;
-	char *endptr;
-	const char *warn = "";
-	int ftype;
-
-#ifndef _STRICT_CONFIG_
-	if (ignore_error && !__test_bit(CONFIG_TEST_BIT, &debug))
-		warn = "WARNING - ";
-#endif
-
-	errno = 0;
-	val = strtod(number, &endptr);
-	*res = val;
-
-	if (*endptr)
-		report_config_error(CONFIG_INVALID_NUMBER, "%sinvalid number '%s'", warn, number);
-	else if (errno == ERANGE)
-		report_config_error(CONFIG_INVALID_NUMBER, "%snumber '%s' out of range", warn, number);
-	else {
-		ftype = fpclassify(val);
-		if (ftype == FP_INFINITE)	/* +/- Inf */
-			report_config_error(CONFIG_INVALID_NUMBER, "infinite number '%s'", number);
-		else if (ftype == FP_NAN)	/* NaN */
-			report_config_error(CONFIG_INVALID_NUMBER, "not a number '%s'", number);
-		else if (ftype == FP_SUBNORMAL)	{ /* to small */
-			*res = 0.0F;
-			return true;
-		}
-		else if (val < min_val || val > max_val)
-			report_config_error(CONFIG_INVALID_NUMBER, "number '%s' outside range [%g, %g]", number, min_val, max_val);
-		else /* FP_NORMAL or FP_ZERO */
-			return true;
-	}
-
-#ifdef _STRICT_CONFIG_
-	return false;
-#else
-	return ignore_error && val >= min_val && val <= max_val && !__test_bit(CONFIG_TEST_BIT, &debug);
-#endif
-}
-
-bool
-read_int(const char *str, int *res, int min_val, int max_val, bool ignore_error)
-{
-	return read_int_func(str, 10, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_unsigned(const char *str, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
-{
-	return read_unsigned_func(str, 10, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_unsigned64(const char *str, uint64_t *res, uint64_t min_val, uint64_t max_val, bool ignore_error)
-{
-	return read_unsigned64_func(str, 10, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_double(const char *str, double *res, double min_val, double max_val, bool ignore_error)
-{
-	return read_double_func(str, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_int_strvec(const vector_t *strvec, size_t index, int *res, int min_val, int max_val, bool ignore_error)
-{
-	return read_int_func(strvec_slot(strvec, index), 10, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
-{
-	return read_unsigned_func(strvec_slot(strvec, index), 10, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_unsigned64_strvec(const vector_t *strvec, size_t index, uint64_t *res, uint64_t min_val, uint64_t max_val, bool ignore_error)
-{
-	return read_unsigned64_func(strvec_slot(strvec, index), 10, res, min_val, max_val, ignore_error);
-}
-
-bool
-read_double_strvec(const vector_t *strvec, size_t index, double *res, double min_val, double max_val, bool ignore_error)
-{
-	return read_double_func(strvec_slot(strvec, index), res, min_val, max_val, ignore_error);
-}
-
-bool
-read_unsigned_base_strvec(const vector_t *strvec, size_t index, int base, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
-{
-	return read_unsigned_func(strvec_slot(strvec, index), base, res, min_val, max_val, ignore_error);
-}
-
 /* Read a fractional decimal with up to shift decimal places. Return value * 10^shift. For example to read 3.312 as milliseconds, but
  * return 3312, as micro-seconds, specify a shift value of 3 (i.e. 10^3 = 1000). The min_val and max_val are in the units of the returned value.
  */
-bool
-read_decimal_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res, unsigned min_val, unsigned max_val, unsigned shift, bool ignore_error)
+static bool
+read_decimal_unsigned_long_func(const char *param, unsigned long *res, unsigned long min_val, unsigned long max_val, unsigned shift, bool ignore_error)
 {
-	const char *param = strvec_slot(strvec, index);
 	size_t param_len = strlen(param);
 	char *updated_param;
 	const char *dp;
 	unsigned num_dp;
 	const char *warn = "";
-	bool ret;
 	unsigned i;
 	bool round_up = false;
+	bool valid_number;
+	unsigned long long val;
+	char *endptr;
+	int sav_errno;
 
 #ifndef _STRICT_CONFIG_
 	if (ignore_error && !__test_bit(CONFIG_TEST_BIT, &debug))
 		warn = "WARNING - ";
 #endif
+
+	if (param[0] == '-') {
+		report_config_error(CONFIG_INVALID_NUMBER, "%snegative number '%s'", warn, param);
+		return false;
+	}
 
 	/* Make sure we don't have too many decimal places */
 	dp = strchr(param, '.');
@@ -678,14 +591,108 @@ read_decimal_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res
 	for (i = 0; i < num_dp; i++)
 		strcat(updated_param, "0");
 
-	ret = read_unsigned_func(updated_param, 10, res, min_val, max_val, ignore_error);
+	errno = 0;
+	val = strtoull(updated_param, &endptr, 10);
+	if (round_up)
+		val++;
+	*res = (unsigned long)val;
 
+	valid_number = !*endptr;
+	sav_errno = errno;
 	FREE(updated_param);
 
-	if (round_up)
-		*res += 1;
+	if (!valid_number)
+		report_config_error(CONFIG_INVALID_NUMBER, "%sinvalid number '%s'", warn, param);
+	else if (sav_errno == ERANGE
+#if ULLONG_MAX > ULONG_MAX
+				     || val > ULONG_MAX
+#endif
+							) {
+		report_config_error(CONFIG_INVALID_NUMBER, "%snumber '%s' outside unsigned decimal range", warn, param);
+		return false;
+	} else if (val < min_val || val > max_val) {
+		unsigned long dp_val = 1;
+		unsigned d;
+		for (d = 0; d < shift; d++)
+			dp_val *= 10;
+		report_config_error(CONFIG_INVALID_NUMBER, "%snumber '%s' outside range [%lu.%*.*lu, %lu.%*.*lu]",
+			warn, param, min_val / dp_val, (int)shift, (int)shift, min_val % dp_val, max_val / dp_val, (int)shift, (int)shift, max_val % dp_val);
+	} else
+		return true;
+
+#ifdef _STRICT_CONFIG_
+	return false;
+#else
+	return ignore_error && val >= min_val && val <= max_val;
+#endif
+}
+
+static bool
+read_decimal_unsigned_func(const char *str, unsigned *res, unsigned min_val, unsigned max_val, unsigned shift, bool ignore_error)
+{
+	unsigned long resl;
+	int ret;
+
+	ret = read_decimal_unsigned_long_func(str, &resl, min_val, max_val, shift, ignore_error);
+	if (ret)
+		*res = (unsigned)resl;
 
 	return ret;
+}
+
+
+bool
+read_int(const char *str, int *res, int min_val, int max_val, bool ignore_error)
+{
+	return read_int_func(str, 10, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_unsigned(const char *str, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
+{
+	return read_unsigned_func(str, 10, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_unsigned64(const char *str, uint64_t *res, uint64_t min_val, uint64_t max_val, bool ignore_error)
+{
+	return read_unsigned64_func(str, 10, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_decimal_unsigned(const char *str, unsigned *res, unsigned min_val, unsigned max_val, unsigned shift, bool ignore_error)
+{
+	return read_decimal_unsigned_func(str, res, min_val, max_val, shift, ignore_error);
+}
+
+bool
+read_int_strvec(const vector_t *strvec, size_t index, int *res, int min_val, int max_val, bool ignore_error)
+{
+	return read_int_func(strvec_slot(strvec, index), 10, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
+{
+	return read_unsigned_func(strvec_slot(strvec, index), 10, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_unsigned64_strvec(const vector_t *strvec, size_t index, uint64_t *res, uint64_t min_val, uint64_t max_val, bool ignore_error)
+{
+	return read_unsigned64_func(strvec_slot(strvec, index), 10, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_unsigned_base_strvec(const vector_t *strvec, size_t index, int base, unsigned *res, unsigned min_val, unsigned max_val, bool ignore_error)
+{
+	return read_unsigned_func(strvec_slot(strvec, index), base, res, min_val, max_val, ignore_error);
+}
+
+bool
+read_decimal_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res, unsigned min_val, unsigned max_val, unsigned shift, bool ignore_error)
+{
+	return read_decimal_unsigned_func(strvec_slot(strvec, index), res, min_val, max_val, shift, ignore_error);
 }
 
 /* read_hex_str() reads a hex string, which can include spaces, and saves the string in
@@ -694,6 +701,11 @@ read_decimal_unsigned_strvec(const vector_t *strvec, size_t index, unsigned *res
  * The string can include wildcard characters, x or X, in which
  * case mask will be allocated and used to indicate the wildcard half octets (nibbles)
  */
+
+/* The following must have values > 0x0f */
+#define HEX_ERROR	0xff
+#define HEX_WILDCARD	0xfe
+
 static uint8_t
 hex_val(char p, bool allow_wildcard)
 {
@@ -705,9 +717,9 @@ hex_val(char p, bool allow_wildcard)
 		return p - 'A' + 10;
 
 	if (allow_wildcard && p == 'X')
-		return 0xfe;
+		return HEX_WILDCARD;
 
-	return 0xff;
+	return HEX_ERROR;
 }
 
 uint16_t
@@ -722,6 +734,7 @@ read_hex_str(const char *str, uint8_t **data, uint8_t **data_mask)
 	uint8_t mask_val;
 	bool using_mask = false;
 	uint16_t len;
+	bool has_error = false;
 
 	/* The output octet string cannot be longer than (strlen(str) + 1)/2 */
 	str_len = (strlen(str) + 1) / 2;
@@ -738,9 +751,11 @@ read_hex_str(const char *str, uint8_t **data, uint8_t **data_mask)
 			break;
 
 		val = hex_val(*p++, !!data_mask);
-		if (val == 0xff)
+		if (val == HEX_ERROR) {
+			has_error = true;
 			break;
-		if (val == 0xfe) {
+		}
+		if (val == HEX_WILDCARD) {
 			mask_val = 0x0f;
 			val = 0;
 			using_mask = true;
@@ -751,9 +766,11 @@ read_hex_str(const char *str, uint8_t **data, uint8_t **data_mask)
 			val1 = val << 4;
 			mask_val <<= 4;
 			val = hex_val(*p++, !!data_mask);
-			if (val == 0xff)
+			if (val == HEX_ERROR) {
+				has_error = true;
 				break;
-			if (val == 0xfe) {
+			}
+			if (val == HEX_WILDCARD) {
 				mask_val |= 0x0f;
 				val = 0;
 				using_mask = true;
@@ -766,7 +783,7 @@ read_hex_str(const char *str, uint8_t **data, uint8_t **data_mask)
 		len++;
 	}
 
-	if (val == 0xff || !len) {
+	if (has_error || !len) {
 		FREE_ONLY(buf);
 		FREE_ONLY(mask);
 		return 0;
@@ -798,6 +815,19 @@ read_hex_str(const char *str, uint8_t **data, uint8_t **data_mask)
 	return len;
 }
 
+#undef HEX_ERROR
+#undef HEX_WILDCARD
+
+void
+set_string(const char **var, const vector_t *strvec, const char *param_name)
+{
+	if (*var) {
+		report_config_error(CONFIG_GENERAL_ERROR, "Duplicate %s - overwriting %s with %s", param_name, *var, strvec_slot(strvec, 1));
+		FREE_CONST_PTR(*var);
+	}
+	*var = set_value(strvec);
+}
+
 void
 set_random_seed(unsigned int seed)
 {
@@ -806,7 +836,7 @@ set_random_seed(unsigned int seed)
 }
 
 static void
-keyword_alloc(vector_t *keywords_vec, const char *string, void (*handler) (const vector_t *), bool active)
+keyword_alloc(vector_t *keywords_vec, const char *string, void (*handler) (const vector_t *), bool active, bool allow_mismatched_quotes)
 {
 	keyword_t *keyword;
 
@@ -816,12 +846,14 @@ keyword_alloc(vector_t *keywords_vec, const char *string, void (*handler) (const
 	keyword->string = string;
 	keyword->handler = handler;
 	keyword->active = active;
+	keyword->ptr = cur_check_ptr;
+	keyword->allow_mismatched_quotes = allow_mismatched_quotes;
 
 	vector_set_slot(keywords_vec, keyword);
 }
 
 static void
-keyword_alloc_sub(vector_t *keywords_vec, const char *string, void (*handler) (const vector_t *))
+keyword_alloc_sub(vector_t *keywords_vec, const char *string, void (*handler) (const vector_t *), bool allow_mismatched_quotes)
 {
 	int i = 0;
 	keyword_t *keyword;
@@ -842,52 +874,55 @@ keyword_alloc_sub(vector_t *keywords_vec, const char *string, void (*handler) (c
 		keyword->sub = vector_alloc();
 
 	/* add new sub keyword */
-	keyword_alloc(keyword->sub, string, handler, true);
+	keyword_alloc(keyword->sub, string, handler, true, allow_mismatched_quotes);
 }
 
 /* Exported helpers */
-void
-install_sublevel(void)
+vpp_t
+install_sublevel(vpp_t new_check_ptr)
 {
+	vpp_t old_cur_check_ptr = cur_check_ptr;
+
 	sublevel++;
+	cur_check_ptr = new_check_ptr;
+
+	return old_cur_check_ptr;
 }
 
 void
-install_sublevel_end(void)
+install_sublevel_end(vpp_t check_ptr)
 {
 	sublevel--;
+
+	cur_check_ptr = check_ptr;
 }
 
 void
-install_keyword_root(const char *string, void (*handler) (const vector_t *), bool active)
+install_keyword_root(const char *string, void (*handler) (const vector_t *), bool active, vpp_t ptr)
 {
 	/* If the root keyword is inactive, the handler will still be called,
 	 * but with a NULL strvec */
-	keyword_alloc(keywords, string, handler, active);
-}
-
-void
-install_root_end_handler(void (*handler) (void))
-{
-	keyword_t *keyword;
-
-	/* fetch last keyword */
-	keyword = vector_slot(keywords, vector_size(keywords) - 1);
-
-	if (!keyword->active)
-		return;
-
-	keyword->sub_close_handler = handler;
+	cur_check_ptr = NULL;
+	keyword_alloc(keywords, string, handler, active, false);
+	cur_check_ptr = ptr;
 }
 
 void
 install_keyword(const char *string, void (*handler) (const vector_t *))
 {
-	keyword_alloc_sub(keywords, string, handler);
+	keyword_alloc_sub(keywords, string, handler, false);
 }
 
 void
-install_sublevel_end_handler(void (*handler) (void))
+install_keyword_quoted(const char *string, void (*handler) (const vector_t *))
+{
+	/* This is a special instance when the second parameter can be a
+	 * quoted escaped string. */
+	keyword_alloc_sub(keywords, string, handler, true);
+}
+
+void
+install_level_end_handler(void (*handler) (void))
 {
 	int i = 0;
 	keyword_t *keyword;
@@ -901,7 +936,9 @@ install_sublevel_end_handler(void (*handler) (void))
 	/* position to last sub level */
 	for (i = 0; i < sublevel; i++)
 		keyword = vector_slot(keyword->sub, vector_size(keyword->sub) - 1);
+
 	keyword->sub_close_handler = handler;
+	keyword->sub_close_ptr = cur_check_ptr;
 }
 
 #ifdef _DUMP_KEYWORDS_
@@ -910,18 +947,30 @@ dump_keywords(vector_t *keydump, int level, FILE *fp)
 {
 	unsigned int i;
 	keyword_t *keyword_vec;
-	char file_name[KA_TMP_DIR_LEN + 1 + 8 + 1 + PID_MAX_DIGITS + 1];		/* KA_TMP_DIR/keywords.PID\0 */
+	char *file_name;
+	char file_name_len;
 
 	if (!level) {
-		snprintf(file_name, sizeof(file_name), KA_TMP_DIR "/keywords.%d", getpid());
+		file_name_len = strlen(tmp_dir) + 1 + 8 + 1 + PID_MAX_DIGITS + 1;		/* TMP_DIR/keywords.PID\0 */
+		file_name = MALLOC(file_name_len);
+		snprintf(file_name, file_name_len, "%s/keywords.%d", tmp_dir, getpid());
+
 		fp = fopen_safe(file_name, "w");
+
+		FREE(file_name);
+
 		if (!fp)
 			return;
 	}
 
 	for (i = 0; i < vector_size(keydump); i++) {
 		keyword_vec = vector_slot(keydump, i);
-		fprintf(fp, "%*sKeyword : %s (%s)\n", level * 2, "", keyword_vec->string, keyword_vec->active ? "active": "disabled");
+		fprintf(fp, "%*sKeyword : %s (%s), ptr %p", level * 2, "", keyword_vec->string,
+			    keyword_vec->active ? "active" : "disabled", keyword_vec->ptr);
+		if (keyword_vec->sub_close_handler)
+			    fprintf(fp, " sub_end %p sub_end_ptr %p\n", keyword_vec->sub_close_handler, keyword_vec->sub_close_ptr);
+		else
+			fprintf(fp, "\n");
 		if (keyword_vec->sub)
 			dump_keywords(keyword_vec->sub, level + 1, fp);
 	}
@@ -997,8 +1046,8 @@ get_random(const def_t *def)
 	return rand_str;
 }
 
-const vector_t *
-alloc_strvec_quoted_escaped(const char *src)
+static const vector_t *
+alloc_strvec_quoted_escaped_common(const char *src, bool escapes)
 {
 	vector_t *strvec;
 	char cur_quote = 0;
@@ -1006,6 +1055,7 @@ alloc_strvec_quoted_escaped(const char *src)
 	char *op_buf;
 	const char *ofs, *ofs1;
 	char op_char;
+	unsigned i;
 
 	if (!src) {
 		if (!buf_extern)
@@ -1056,61 +1106,66 @@ alloc_strvec_quoted_escaped(const char *src)
 					goto err_exit;
 				}
 
-				if (*ofs == 'x' && isxdigit(ofs[1])) {
-					op_char = 0;
-					ofs++;
-					while (isxdigit(*ofs)) {
-						op_char <<= 4;
-						op_char |= isdigit(*ofs) ? *ofs - '0' : (10 + *ofs - (isupper(*ofs)  ? 'A' : 'a'));
+				if (escapes) {
+					if (*ofs == 'x' && isxdigit(ofs[1])) {
+						op_char = 0;
+						ofs++;
+						for (i = 0; i <= 1 && isxdigit(*ofs); i++) {
+							op_char <<= 4;
+							op_char |= isdigit(*ofs) ? *ofs - '0' : (10 + *ofs - (isupper(*ofs)  ? 'A' : 'a'));
+							ofs++;
+						}
+					}
+					else if (*ofs == 'c' && ofs[1]) {
+						op_char = *++ofs & 0x1f;	/* Convert to control character */
 						ofs++;
 					}
-				}
-				else if (*ofs == 'c' && ofs[1]) {
-					op_char = *++ofs & 0x1f;	/* Convert to control character */
-					ofs++;
-				}
-				else if (*ofs >= '0' && *ofs <= '7') {
-					op_char = *ofs++ - '0';
-					if (*ofs >= '0' && *ofs <= '7') {
-						op_char <<= 3;
-						op_char += *ofs++ - '0';
+					else if (*ofs >= '0' && *ofs <= '7') {
+						op_char = *ofs++ - '0';
+						if (*ofs >= '0' && *ofs <= '7') {
+							op_char <<= 3;
+							op_char += *ofs++ - '0';
+						}
+						if (*ofs >= '0' && *ofs <= '7') {
+							op_char <<= 3;
+							op_char += *ofs++ - '0';
+						}
 					}
-					if (*ofs >= '0' && *ofs <= '7') {
-						op_char <<= 3;
-						op_char += *ofs++ - '0';
+					else {
+						switch (*ofs) {
+						case 'a':
+							op_char = '\a';
+							break;
+						case 'b':
+							op_char = '\b';
+							break;
+						case 'E':
+							op_char = 0x1b;
+							break;
+						case 'f':
+							op_char = '\f';
+							break;
+						case 'n':
+							op_char = '\n';
+							break;
+						case 'r':
+							op_char = '\r';
+							break;
+						case 't':
+							op_char = '\t';
+							break;
+						case 'v':
+							op_char = '\v';
+							break;
+						default: /* \"'  */
+							op_char = *ofs;
+							break;
+						}
+						ofs++;
 					}
-				}
-				else {
-					switch (*ofs) {
-					case 'a':
-						op_char = '\a';
-						break;
-					case 'b':
-						op_char = '\b';
-						break;
-					case 'E':
-						op_char = 0x1b;
-						break;
-					case 'f':
-						op_char = '\f';
-						break;
-					case 'n':
-						op_char = '\n';
-						break;
-					case 'r':
-						op_char = '\r';
-						break;
-					case 't':
-						op_char = '\t';
-						break;
-					case 'v':
-						op_char = '\v';
-						break;
-					default: /* \"'  */
-						op_char = *ofs;
-						break;
-					}
-					ofs++;
+				} else {
+					*ofs_op++ = '\\';
+					op_char = *ofs++;
 				}
 
 				*ofs_op++ = op_char;
@@ -1152,12 +1207,28 @@ err_exit:
 	return NULL;
 }
 
+const vector_t *
+alloc_strvec_quoted_escaped(const char *src)
+{
+	return alloc_strvec_quoted_escaped_common(src, true);
+}
+
+const vector_t *
+alloc_strvec_quoted(const char *src)
+{
+	return alloc_strvec_quoted_escaped_common(src, false);
+}
+
 vector_t *
-alloc_strvec_r(const char *string)
+alloc_strvec_r(const char *string, const vector_t *keywords_vec)
 {
 	const char *cp, *start;
 	size_t str_len;
 	vector_t *strvec;
+	unsigned i;
+	bool allow_mismatched_quotes;
+	keyword_t *keyword_vec;
+	const char *keyword;
 
 	if (!string)
 		return NULL;
@@ -1177,7 +1248,26 @@ alloc_strvec_r(const char *string)
 		if (*start == '"') {
 			start++;
 			if (!(cp = strchr(start, '"'))) {
-				report_config_error(CONFIG_UNMATCHED_QUOTE, "Unmatched quote: '%s'", string);
+				allow_mismatched_quotes = false;
+				if (vector_size(strvec) > 1 && keywords_vec) {
+					keyword = strvec_slot(strvec, 0);
+
+					/* Check to see if the second string will be reprocessed */
+					for (i = 0; i < vector_size(keywords_vec); i++) {
+						keyword_vec = vector_slot(keywords_vec, i);
+
+						if (!strcmp(keyword_vec->string, keyword)) {
+							allow_mismatched_quotes = keyword_vec->allow_mismatched_quotes;
+							break;
+						}
+					}
+				}
+				if (!allow_mismatched_quotes
+#ifndef _ONE_PROCESS_DEBUG_
+				     && prog_type != PROG_TYPE_PARENT
+#endif
+								     )
+					report_config_error(CONFIG_UNMATCHED_QUOTE, "Unmatched quote: '%s'", string);
 				break;
 			}
 			str_len = (size_t)(cp - start);
@@ -1583,6 +1673,7 @@ dump_definitions(void)
 }
 #endif
 
+#if HAVE_DECL_GLOB_ALTDIRFUNC
 static DIR *
 gl_opendir(const char *name)
 {
@@ -1620,14 +1711,16 @@ have_brace(const char *conf_file)
 		return false;
 
 	do {
-		if (*p == '\\')
-			p++;
-		else if (*p == '{')
+		if (*p == '\\')	{	// Skip a '\' and following character
+			if (!*++p)	// Ensure '\' not last character
+				return false;
+		} else if (*p == '{')
 			return true;
 	} while (*++p);
 
 	return false;
 }
+#endif
 
 static bool
 open_and_check_glob(glob_t *globbuf, const char *conf_file, include_t include_type)
@@ -1636,11 +1729,13 @@ open_and_check_glob(glob_t *globbuf, const char *conf_file, include_t include_ty
 
 	globbuf->gl_offs = 0;
 
+#if HAVE_DECL_GLOB_ALTDIRFUNC
 	globbuf->gl_closedir = (void *)closedir;
 	globbuf->gl_readdir = (void *)readdir;
 	globbuf->gl_opendir = (void *)gl_opendir;
 	globbuf->gl_lstat = (void *)gl_lstat;
 	globbuf->gl_stat = (void *)stat;
+#endif
 
 	/* NOTE: the following three variables are not declared static, since otherwise GCC (at least v9.3.0,
 	 * 9.3.1 and 10.2.1) -O1 optimisation assumes that they cannot be altered by the call to glob(), if
@@ -1653,28 +1748,39 @@ open_and_check_glob(glob_t *globbuf, const char *conf_file, include_t include_ty
 	 *
 	 * See https://gcc.gnu.org/bugzilla/show_bug.cgi?id=97783 for more details.
 	 */
+#if HAVE_DECL_GLOB_ALTDIRFUNC
 	missing_files = 0;
 	missing_directories = 0;
 	have_wildcards = false;
+#endif
 
-	res = glob(conf_file, GLOB_MARK | GLOB_ALTDIRFUNC
+	res = glob(conf_file, GLOB_MARK
 #if HAVE_DECL_GLOB_BRACE
 					| GLOB_BRACE
+#endif
+#if HAVE_DECL_GLOB_ALTDIRFUNC
+					| GLOB_ALTDIRFUNC
 #endif
 						    , NULL, globbuf);
 
 	if (res) {
 		if (res == GLOB_NOMATCH) {
+#if HAVE_DECL_GLOB_ALTDIRFUNC
 			if (missing_files || missing_directories)
 				file_config_error(have_brace(conf_file) ? INCLUDE_B : INCLUDE_M, "Config files missing '%s'.", conf_file);
 			else if (have_wildcards && ((include_check | include_type) & INCLUDE_W))
 				file_config_error(INCLUDE_W, "No config files matched '%s'.", conf_file);
+#else
+			if ((include_check | include_type) & INCLUDE_W)
+				file_config_error(INCLUDE_W, "No config files matched '%s'.", conf_file);
+#endif
 		} else
 			file_config_error(INCLUDE_R, "Error reading config file(s): glob(\"%s\") returned %d, skipping.", conf_file, res);
 
 		return false;
 	}
 
+#if HAVE_DECL_GLOB_ALTDIRFUNC
 	if (missing_directories || missing_files) {
 		file_config_error(INCLUDE_B, "Some config files missing: \"%s\".", conf_file);
 
@@ -1683,6 +1789,7 @@ open_and_check_glob(glob_t *globbuf, const char *conf_file, include_t include_ty
 			return false;
 		}
 	}
+#endif
 
 	return true;
 }
@@ -2023,7 +2130,7 @@ check_definition(const char *buf)
 	char *str;
 
 	if (buf[0] != '$')
-		return false;
+		return NULL;
 
 	if (!isalpha(buf[1]) && buf[1] != '_')
 		return NULL;
@@ -2224,15 +2331,16 @@ read_value_block(const vector_t *strvec)
 bool
 read_timer(const vector_t *strvec, size_t index, unsigned long *res, unsigned long min_time, unsigned long max_time, bool ignore_error)
 {
-	double timer;
+	unsigned long timer;
 	bool ret;
-	double fmin_time, fmax_time;
 
-	fmin_time = (double)min_time / TIMER_HZ;
-	fmax_time = (double)((max_time) ? max_time : TIMER_MAXIMUM) / TIMER_HZ;
+	if (!max_time)
+		max_time = TIMER_MAXIMUM;
 
-	ret = read_double_strvec(strvec, index, &timer, fmin_time, fmax_time, ignore_error);
-	*res = timer * TIMER_HZ > TIMER_MAXIMUM ? TIMER_MAXIMUM : (unsigned long)(timer * TIMER_HZ);
+	ret = read_decimal_unsigned_long_func(strvec_slot(strvec, index), &timer, min_time, max_time, TIMER_HZ_DIGITS, ignore_error);
+
+	if (ret)
+		*res = timer;
 
 	return ret;
 }
@@ -2293,15 +2401,8 @@ open_conf_file(include_file_t *file)
 		file->current_line_no = 0;
 
 		if (strchr(file->globbuf.gl_pathv[i], '/')) {
-			/* If the filename contains a directory element, change to that directory.
-			   The man page open(2) states that fchdir() didn't support O_PATH until Linux 3.5,
-			   even though testing on Linux 3.1 shows it appears to work. To be safe, don't
-			   use it until Linux 3.5. */
-			file->curdir_fd = open(".", O_RDONLY | O_DIRECTORY
-#if HAVE_DECL_O_PATH && LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
-								     | O_PATH
-#endif
-									     );
+			/* If the filename contains a directory element, change to that directory. */
+			file->curdir_fd = open(".", O_RDONLY | O_DIRECTORY | O_PATH);
 
 			char *confpath = STRDUP(file->globbuf.gl_pathv[i]);
 			dirname(confpath);
@@ -2449,14 +2550,21 @@ check_include(const char *buf)
 		p = buf + 9;
 		if (buf[7] == 'r')
 			include_type = INCLUDE_R;
-		else if (buf[7] == 'm')
-			include_type = INCLUDE_R | INCLUDE_M;
+		else if (buf[7] == 'a')
+			include_type = INCLUDE_R | INCLUDE_M | INCLUDE_B | INCLUDE_W;
 		else if (buf[7] == 'w')
 			include_type = INCLUDE_R | INCLUDE_M | INCLUDE_W;
-		else if (buf[7] == 'b')
+#if HAVE_DECL_GLOB_ALTDIRFUNC
+		else if (buf[7] == 'm')
+			include_type = INCLUDE_R | INCLUDE_M;
+		else /* if (buf[7] == 'b') */
 			include_type = INCLUDE_R | INCLUDE_B;
-		else /* if (buf[7] == 'a') */
-			include_type = INCLUDE_R | INCLUDE_M | INCLUDE_B | INCLUDE_W;
+#else
+		else {
+			report_config_error(CONFIG_WARNING, "include%c not supported - treating as includer", buf[7]);
+			include_type = INCLUDE_R;
+		}
+#endif
 	}
 
 	p += strspn(p, " \t");
@@ -2605,15 +2713,8 @@ read_line(char *buf, size_t size)
 						file->current_file_name = file->file_name;
 						list_head_add(&file->e_list, &include_stack);
 						if (strchr(file->current_file_name, '/')) {
-							/* If the filename contains a directory element, change to that directory.
-							   The man page open(2) states that fchdir() didn't support O_PATH until Linux 3.5,
-							   even though testing on Linux 3.1 shows it appears to work. To be safe, don't
-							   use it until Linux 3.5. */
-							file->curdir_fd = open(".", O_RDONLY | O_DIRECTORY
-#if HAVE_DECL_O_PATH && LINUX_VERSION_CODE >= KERNEL_VERSION(3,5,0)
-												     | O_PATH
-#endif
-													     );
+							/* If the filename contains a directory element, change to that directory. */
+							file->curdir_fd = open(".", O_RDONLY | O_DIRECTORY | O_PATH);
 
 							char *confpath = STRDUP(buf + 2);
 							dirname(confpath);
@@ -2793,6 +2894,9 @@ read_line(char *buf, size_t size)
 					recheck = true;
 				if (strchr(buf, '$'))
 					recheck = true;
+
+				if (recheck)
+					len = strlen(buf);
 			}
 		} while (recheck);
 	} while (buf[0] == '\0' || check_include(buf));
@@ -2892,7 +2996,7 @@ alloc_value_block(void (*alloc_func) (const vector_t *), const vector_t *strvec)
 	while (first_vec || read_line(buf, MAXBUF)) {
 		if (first_vec)
 			vec = first_vec;
-		else if (!(vec = alloc_strvec(buf)))
+		else if (!(vec = alloc_strvec(buf, NULL)))
 			continue;
 
 		if (!first_vec) {
@@ -2956,7 +3060,7 @@ process_stream(vector_t *keywords_vec, int need_bob)
 
 	buf = MALLOC(MAXBUF);
 	while (read_line(buf, MAXBUF)) {
-		strvec = alloc_strvec(buf);
+		strvec = alloc_strvec(buf, keywords_vec);
 
 		if (!strvec)
 			continue;
@@ -3053,7 +3157,7 @@ process_stream(vector_t *keywords_vec, int need_bob)
 						bob_needed = 1;
 				}
 
-				if (keyword_vec->active && keyword_vec->handler) {
+				if (keyword_vec->active && keyword_vec->handler && (!keyword_vec->ptr || *keyword_vec->ptr)) {
 					buf_extern = buf;	/* In case the raw line wants to be accessed */
 					(*keyword_vec->handler) (strvec);
 				}
@@ -3064,8 +3168,17 @@ process_stream(vector_t *keywords_vec, int need_bob)
 					kw_level--;
 
 					/* We mustn't run any close handler if the block was skipped */
-					if (!ret && keyword_vec->active && keyword_vec->sub_close_handler)
-						(*keyword_vec->sub_close_handler) ();
+					if (!ret &&
+					    keyword_vec->active) {
+						if (keyword_vec->sub_close_handler &&
+						    (!keyword_vec->sub_close_ptr || *keyword_vec->sub_close_ptr))
+							(*keyword_vec->sub_close_handler)();
+
+						/* We have finished the block, so the *keyword_vec->sub_close_ptr item is no longer current */
+						if (keyword_vec->sub_close_ptr)
+							*keyword_vec->sub_close_ptr = NULL;
+					}
+
 				}
 				break;
 			}
@@ -3088,6 +3201,9 @@ init_data(const char *conf_file, const vector_t * (*init_keywords) (void), bool 
 {
 	bool file_opened = false;
 	int fd;
+#ifndef _ONE_PROCESS_DEBUG_
+	static unsigned conf_num = 0;
+#endif
 
 	/* A parent process or previous config load may have left these set */
 	block_depth = 0;
@@ -3119,29 +3235,46 @@ init_data(const char *conf_file, const vector_t * (*init_keywords) (void), bool 
 		if (!conf_copy) {
 #if defined HAVE_MEMFD_CREATE || defined USE_MEMFD_CREATE_SYSCALL
 			fd = memfd_create("/keepalived/consolidated_configuration", MFD_CLOEXEC);
+
+			/* SELinux can allow memfd_create() to succeed, but reads and writes fail.
+			 * Perversely the open does not log an SELinux error if keepalived has no
+			 * permissions for "tmpfs", but if it has read and write permissions but
+			 * not open permission, then the open fails. */
+			if (fd != -1) {
+				char read_byte;		/* coverity[suspicious_sizeof] is generated if this is an int */
+
+				if (read(fd, &read_byte, 1) == -1) {
+					if (errno == EACCES)
+						log_message(LOG_INFO, "SELinux permissions for memfd (tmpfs) appear to be missing for keepalived");
+					else
+						log_message(LOG_INFO, "read from memfd failed with errno %d - %m", errno);
+					close(fd);
+					fd = open_tmpfile(RUNSTATEDIR, O_RDWR | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+				}
+			}
 #endif
 #ifndef HAVE_MEMFD_CREATE
 #ifdef USE_MEMFD_CREATE_SYSCALL
 			if (fd == -1 && errno == ENOSYS)
 #endif
-				fd = open_tmpfile(KA_TMP_DIR, O_RDWR | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
+				fd = open_tmpfile(RUNSTATEDIR, O_RDWR | O_EXCL | O_CLOEXEC, S_IRUSR | S_IWUSR);
 #endif
 			if (fd == -1)
-				log_message(LOG_INFO, "memfd_create error %d - %m", errno);
+				log_message(LOG_INFO, "conf_copy open error %d - %m", errno);
 			else {
 				conf_copy = fdopen(fd, "w+");
 				if (!conf_copy)
-					log_message(LOG_INFO, "fdopen of memfd_create error %d - %m", errno);
+					log_message(LOG_INFO, "fdopen of conf_copy fd error %d - %m", errno);
 			}
 		} else {
-#ifndef TRUNCATE_FILE_AFTER_READ
 			if (ftruncate(fileno(conf_copy), 0))
 				log_message(LOG_INFO, "Failed to truncate config copy file (%d) - %m", errno);
-#endif
 
 			rewind(conf_copy);
 		}
-		write_conf_copy = true;
+
+		if (conf_copy)
+			write_conf_copy = true;
 	}
 
 	if (!copy_config && conf_copy) {
@@ -3187,17 +3320,25 @@ init_data(const char *conf_file, const vector_t * (*init_keywords) (void), bool 
 						      , block_depth, EOB, BOB);
 	}
 
-	if (write_conf_copy) {
+	if (conf_copy && write_conf_copy) {
 		fflush(conf_copy);
 		write_conf_copy = false;
 
 		/* Set file offset to beginning ready for next write */
 		rewind(conf_copy);
-	}
 
-	/* If we are not the parent, tell it we have completed reading the configuration */
-	if (prog_type != PROG_TYPE_PARENT && !__test_bit(CONFIG_TEST_BIT, &debug))
-		kill(getppid(), SIGPWR);
+#ifndef _ONE_PROCESS_DEBUG_
+		if (config_save_dir) {
+			char buf[128];
+			pid_t pid = getpid();
+
+			sprintf(buf, "cp /proc/%d/fd/%d %s/keepalived.conf.%d.%u", pid, fileno(conf_copy), config_save_dir, pid, conf_num++);
+			if (system(buf)) {
+				/* If it fails, there is nothing we can do about it */
+			};
+		}
+#endif
+	}
 
 	/* Close the password database if it was opened */
 	endpwent();
@@ -3206,15 +3347,6 @@ init_data(const char *conf_file, const vector_t * (*init_keywords) (void), bool 
 	free_parser_data();
 
 	notify_resource_release();
-}
-
-void
-truncate_config_copy(void)
-{
-#ifdef TRUNCATE_FILE_AFTER_READ
-	if (conf_copy && ftruncate(fileno(conf_copy), 0))
-		log_message(LOG_INFO, "Failed to truncate config copy file (%d) - %m", errno);
-#endif
 }
 
 int
@@ -3277,6 +3409,17 @@ void include_check_set(const vector_t *strvec)
 				new_flag = INCLUDE_B;
 			else
 				report_config_error(CONFIG_GENERAL_ERROR, "Unknown include_check type '%s' - ignoring", word + offset);
+#if !HAVE_DECL_GLOB_ALTDIRFUNC
+			if (new_flag & (INCLUDE_M | INCLUDE_B)) {
+				if (!add_remove) {
+					report_config_error(CONFIG_WARNING, "include_check type '%s' - not supported, treating as 'read'", word + offset);
+					new_flag = INCLUDE_R;
+				} else {
+					report_config_error(CONFIG_WARNING, "include_check type '%s' - not supported, ignoring", word + offset);
+					new_flag = 0;
+				}
+			}
+#endif
 
 			if (new_flag) {
 				if (!add_remove)
@@ -3295,4 +3438,33 @@ bool
 had_config_file_error(void)
 {
 	return config_file_error;
+}
+
+void
+separate_config_file(void)
+{
+	char buf[32];	/* /proc/self/fd/2147483647\0 */
+	int fd_orig;
+	int fd;
+
+	if (!conf_copy) {
+		log_message(LOG_INFO, "No conf_copy");
+		return;
+	}
+
+	/* We need to open the config file on a different file descriptor so that
+	 * it can be read independantly from the other keepalived processes */
+	fd_orig = fileno(conf_copy);
+	snprintf(buf, sizeof(buf), "/proc/self/fd/%d", fd_orig);
+	if ((fd = open(buf, O_RDONLY)) == -1) {
+		log_message(LOG_INFO, "Failed to open %s for conf_copy", buf);
+		return;
+	}
+#ifdef HAVE_DUP3
+	dup3(fd, fd_orig, O_CLOEXEC);
+#else
+	dup2(fd, fd_orig);
+	fcntl(fd_orig, F_SETFD, fcntl(fd_orig, F_GETFD) | FD_CLOEXEC);
+#endif
+	close(fd);
 }

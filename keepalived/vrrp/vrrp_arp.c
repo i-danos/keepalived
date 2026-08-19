@@ -31,6 +31,7 @@
 #include <net/if_arp.h>
 #include <linux/if_packet.h>
 #include <errno.h>
+#include <stdbool.h>
 
 /* local includes */
 #include "logger.h"
@@ -39,9 +40,6 @@
 #include "bitops.h"
 #include "vrrp_scheduler.h"
 #include "vrrp_arp.h"
-#if !HAVE_DECL_SOCK_CLOEXEC
-#include "old_socket.h"
-#endif
 
 /*
  * The size of the garp_buffer should be the large enough to hold
@@ -53,20 +51,6 @@
  */
 #define GARP_BUFFER_SIZE (sizeof(inf_arphdr_t) + sizeof (ipoib_hdr_t) +\
 			  (INFINIBAND_ALEN))
-
-/*
- * Private link layer socket structure to hold infiniband size address
- * The infiniband MAC address is 20 bytes long
- */
-struct sockaddr_large_ll {
-	unsigned short	sll_family;
-	__be16		sll_protocol;
-	int		sll_ifindex;
-	unsigned short	sll_hatype;
-	unsigned char	sll_pkttype;
-	unsigned char	sll_halen;
-	unsigned char	sll_addr[INFINIBAND_ALEN];
-};
 
 /* static vars */
 static char *garp_buffer;
@@ -117,6 +101,9 @@ ssize_t send_gratuitous_arp_immediate(interface_t *ifp, ip_address_t *ipaddress)
 	ssize_t len, pack_len;
 
 	if (ifp->hw_addr_len == 0)
+		return -1;
+
+	if (!garp_buffer)
 		return -1;
 
 	/* Setup link layer header */
@@ -171,25 +158,20 @@ ssize_t send_gratuitous_arp_immediate(interface_t *ifp, ip_address_t *ipaddress)
 	return len;
 }
 
-static void queue_garp(vrrp_t *vrrp, interface_t *ifp, ip_address_t *ipaddress)
+static void
+queue_garp(interface_t *ifp, ip_address_t *ipaddress)
 {
-	timeval_t next_time = timer_add_now(ifp->garp_delay->garp_interval);
 
-	vrrp->garp_pending = true;
-	ipaddress->garp_gna_pending = true;
+	ipaddress->garp_gna_pending = 1;
 
-	/* Do we need to reschedule the garp thread? */
-	if (!garp_thread || timercmp(&next_time, &garp_next_time, <)) {
-		if (garp_thread)
-			thread_cancel(garp_thread);
+	if (list_empty(&ifp->garp_delay->garp_list))
+		thread_add_timer(master, vrrp_arp_thread, ifp, timer_long(timer_sub_now(ifp->garp_delay->garp_next_time)));
 
-		garp_next_time = next_time;
-
-		garp_thread = thread_add_timer(master, vrrp_arp_thread, NULL, timer_long(timer_sub_now(garp_next_time)));
-	}
+	list_add_tail(&ipaddress->garp_gna_list, &ifp->garp_delay->garp_list);
 }
 
-void send_gratuitous_arp(vrrp_t *vrrp, ip_address_t *ipaddress)
+void
+send_gratuitous_arp(ip_address_t *ipaddress, unsigned rep)
 {
 	interface_t *ifp = IF_BASE_IFP(ipaddress->ifp);
 
@@ -197,51 +179,51 @@ void send_gratuitous_arp(vrrp_t *vrrp, ip_address_t *ipaddress)
 	if (ifp->ifi_flags & IFF_NOARP)
 		return;
 
+	if (ipaddress->garp_gna_pending) {
+		if (ipaddress->garp_gna_pending < rep)
+			ipaddress->garp_gna_pending++;
+		return;
+	}
+
 	set_time_now();
 
 	/* Do we need to delay sending the garp? */
 	if (ifp->garp_delay &&
 	    ifp->garp_delay->have_garp_interval &&
-	    ifp->garp_delay->garp_next_time.tv_sec) {
-		if (timercmp(&time_now, &ifp->garp_delay->garp_next_time, <)) {
-			queue_garp(vrrp, ifp, ipaddress);
-			return;
-		}
-	}
-
-	send_gratuitous_arp_immediate(ifp, ipaddress);
+	    ifp->garp_delay->garp_next_time.tv_sec &&
+	    timercmp(&time_now, &ifp->garp_delay->garp_next_time, <))
+		queue_garp(ifp, ipaddress);
+	else
+		send_gratuitous_arp_immediate(ifp, ipaddress);
 }
 
 /*
  *	Gratuitous ARP init/close
  */
-void gratuitous_arp_init(void)
+bool
+gratuitous_arp_init(void)
 {
 	if (garp_buffer)
-		return;
+		return true;
 
 	/* Create the socket descriptor */
-	garp_fd = socket(PF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(ETH_P_RARP));
+	garp_fd = socket(PF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(ETH_P_ARP));
 
-	if (garp_fd >= 0) {
-		if (__test_bit(LOG_DETAIL_BIT, &debug))
-			log_message(LOG_INFO, "Registering gratuitous ARP shared channel");
-	} else {
+	if (garp_fd < 0) {
 		log_message(LOG_INFO, "Error %d while registering gratuitous ARP shared channel", errno);
-		return;
+		return (errno != EAFNOSUPPORT && errno != EPERM);
 	}
 
-#if !HAVE_DECL_SOCK_CLOEXEC
-	if (set_sock_flags(garp_fd, F_SETFD, FD_CLOEXEC))
-		log_message(LOG_INFO, "Unable to set CLOEXEC on gratuitous ARP socket");
-#endif
-#if !HAVE_DECL_SOCK_NONBLOCK
-	if (set_sock_flags(garp_fd, F_SETFL, O_NONBLOCK))
-		log_message(LOG_INFO, "Unable to set NONBLOCK on gratuitous ARP socket");
-#endif
+	if (__test_bit(LOG_DETAIL_BIT, &debug))
+		log_message(LOG_INFO, "Registering gratuitous ARP shared channel");
+
+	/* We don't want to receive any data on this socket */
+	if_setsockopt_no_receive(&garp_fd);
 
 	/* Initalize shared buffer */
 	garp_buffer = PTR_CAST(char, MALLOC(GARP_BUFFER_SIZE));
+
+	return true;
 }
 
 void gratuitous_arp_close(void)
