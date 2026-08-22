@@ -417,7 +417,7 @@ Index: b/keepalived/vrrp/vrrp.c
  #define VLAN_TAG_SIZE	4
  
 +#ifdef _RECVMSG_DEBUG_
-+bool do_perpacket_debug;
++extern bool do_perpacket_debug;
 +#endif
 +
 +/* VRRP IPv4 Multicast MAC */
