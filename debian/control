@@ -28,7 +28,7 @@ Replaces:
  vyatta-keepalived (<=1.2.24-git66c870aa+vyatta26)
 Depends: ${shlibs:Depends},
  ipvsadm,
- iproute,
+ iproute2,
  ${misc:Depends}
 Pre-Depends: ${misc:Pre-Depends}
 Description: Failover and monitoring daemon for LVS clusters
